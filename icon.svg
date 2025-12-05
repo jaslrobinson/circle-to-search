@@ -1,0 +1,39 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="bgGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#1e1e2e"/>
+      <stop offset="100%" style="stop-color:#313244"/>
+    </linearGradient>
+    <linearGradient id="circleGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#89b4fa"/>
+      <stop offset="100%" style="stop-color:#b4befe"/>
+    </linearGradient>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="128" cy="128" r="120" fill="url(#bgGrad)"/>
+
+  <!-- Outer ring -->
+  <circle cx="128" cy="128" r="120" fill="none" stroke="#45475a" stroke-width="4"/>
+
+  <!-- Dashed selection circle (the "circle to search" part) -->
+  <circle cx="110" cy="105" r="65" fill="none" stroke="url(#circleGrad)" stroke-width="8" stroke-linecap="round" stroke-dasharray="20 12" opacity="0.9"/>
+
+  <!-- Inner glow effect -->
+  <circle cx="110" cy="105" r="50" fill="#89b4fa" opacity="0.1"/>
+
+  <!-- Magnifying glass circle -->
+  <circle cx="175" cy="170" r="38" fill="none" stroke="url(#circleGrad)" stroke-width="10"/>
+
+  <!-- Magnifying glass handle -->
+  <line x1="200" y1="195" x2="230" y2="225" stroke="url(#circleGrad)" stroke-width="12" stroke-linecap="round"/>
+
+  <!-- Glass reflection -->
+  <ellipse cx="162" cy="158" rx="12" ry="8" fill="#cdd6f4" opacity="0.3" transform="rotate(-30 162 158)"/>
+
+  <!-- Small dots on selection circle for style -->
+  <circle cx="55" cy="75" r="5" fill="#89b4fa"/>
+  <circle cx="165" cy="75" r="5" fill="#b4befe"/>
+  <circle cx="55" cy="135" r="5" fill="#b4befe"/>
+  <circle cx="140" cy="155" r="5" fill="#89b4fa"/>
+</svg>

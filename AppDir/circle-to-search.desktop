@@ -1,0 +1,8 @@
+[Desktop Entry]
+Name=Circle to Search
+Comment=Draw to select, then search with Google Lens or extract text
+Exec=circle-to-search
+Icon=circle-to-search
+Type=Application
+Categories=Utility;Graphics;
+Keywords=screenshot;search;lens;ocr;

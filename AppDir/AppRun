@@ -1,0 +1,11 @@
+#!/bin/bash
+SELF=$(readlink -f "$0")
+HERE=${SELF%/*}
+export PATH="${HERE}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+export PYTHONHOME="${HERE}/usr"
+export PYTHONPATH="${HERE}/usr/lib/python3.11/site-packages"
+export GI_TYPELIB_PATH="${HERE}/usr/lib/girepository-1.0"
+export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS}"
+export TESSDATA_PREFIX="${HERE}/usr/share/tessdata"
+exec "${HERE}/usr/bin/python3" "${HERE}/usr/share/circle-to-search/circle-to-search.py" "$@"
