@@ -1,0 +1,16 @@
+#!/bin/bash
+SELF=$(readlink -f "$0")
+HERE=${SELF%/*}
+
+# Find Python version dynamically
+PYTHON_LIB=$(find "${HERE}/usr/lib" -maxdepth 1 -type d -name "python3.*" | head -1)
+PYTHON_VERSION=$(basename "$PYTHON_LIB")
+
+export PATH="${HERE}/usr/bin:${PATH}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${LD_LIBRARY_PATH}"
+export PYTHONHOME="${HERE}/usr"
+export PYTHONPATH="${PYTHON_LIB}:${PYTHON_LIB}/lib-dynload:${PYTHON_LIB}/site-packages"
+export GI_TYPELIB_PATH="${HERE}/usr/lib/girepository-1.0"
+export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS}"
+export TESSDATA_PREFIX="${HERE}/usr/share/tessdata"
+exec "${HERE}/usr/bin/python3" "${HERE}/usr/share/circle-to-search/circle-to-search.py" "$@"
