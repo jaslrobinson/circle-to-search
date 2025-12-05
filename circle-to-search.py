@@ -84,12 +84,18 @@ class CircleOverlay(Gtk.Window):
         self.connect("key-release-event", self.on_key_release)
 
     def on_draw(self, widget, cr):
-        # Draw the screenshot as background, scaled to screen size
-        # The screenshot is at native resolution, but we display at screen resolution
-        cr.scale(1.0 / self.scale_factor, 1.0 / self.scale_factor)
+        # Draw the screenshot as background, scaled to fit screen
+        # The screenshot is at native resolution, we need to scale it to logical resolution
+        pixbuf_width = self.pixbuf.get_width()
+        pixbuf_height = self.pixbuf.get_height()
+
+        scale_x = self.screen_width / pixbuf_width
+        scale_y = self.screen_height / pixbuf_height
+
+        cr.scale(scale_x, scale_y)
         Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
         cr.paint()
-        cr.scale(self.scale_factor, self.scale_factor)  # Reset scale for drawing
+        cr.scale(1.0 / scale_x, 1.0 / scale_y)  # Reset scale for drawing
 
         # Semi-transparent overlay
         cr.set_source_rgba(0, 0, 0, 0.3)
@@ -260,12 +266,6 @@ class CircleOverlay(Gtk.Window):
 
         x1, y1, x2, y2 = bbox
 
-        # Account for HiDPI scaling
-        x1_scaled = int(x1 * self.scale_factor)
-        y1_scaled = int(y1 * self.scale_factor)
-        x2_scaled = int(x2 * self.scale_factor)
-        y2_scaled = int(y2 * self.scale_factor)
-
         width = x2 - x1
         height = y2 - y1
 
@@ -275,8 +275,19 @@ class CircleOverlay(Gtk.Window):
             Gtk.main_quit()
             return
 
-        # Crop the region
+        # Crop the region - scale coordinates from screen to image
         img = Image.open(self.screenshot_path)
+        img_width, img_height = img.size
+
+        # Calculate scale from screen coords to image coords
+        scale_x = img_width / self.screen_width
+        scale_y = img_height / self.screen_height
+
+        x1_scaled = int(x1 * scale_x)
+        y1_scaled = int(y1 * scale_y)
+        x2_scaled = int(x2 * scale_x)
+        y2_scaled = int(y2 * scale_y)
+
         cropped = img.crop((x1_scaled, y1_scaled, x2_scaled, y2_scaled))
 
         # Resize if too large to avoid memory issues
@@ -328,9 +339,6 @@ class ImagePreviewDialog(Gtk.Window):
         # Image preview in frame
         frame = Gtk.Frame()
         frame.set_shadow_type(Gtk.ShadowType.IN)
-        scrolled = Gtk.ScrolledWindow()
-        scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(280)
 
         # Load and display the cropped image (scale down for preview to avoid memory issues)
         pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
@@ -343,8 +351,13 @@ class ImagePreviewDialog(Gtk.Window):
             pixbuf = pixbuf.scale_simple(int(width * scale), int(height * scale), GdkPixbuf.InterpType.NEAREST)
 
         image = Gtk.Image.new_from_pixbuf(pixbuf)
-        scrolled.add(image)
-        frame.add(scrolled)
+
+        # Center the image using an alignment container
+        alignment = Gtk.Alignment.new(0.5, 0.5, 0, 0)
+        alignment.add(image)
+        alignment.set_size_request(450, 280)
+
+        frame.add(alignment)
         vbox.pack_start(frame, True, True, 0)
 
         # Buttons row 1 - Image search
