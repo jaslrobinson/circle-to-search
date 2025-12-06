@@ -2,12 +2,17 @@
 """
 Circle to Search - Wayland Edition
 Draw to select, then show GTK preview dialog
+
+Modes:
+  --live     Use layer-shell for live screen overlay (Hyprland/Sway only)
+  --static   Use screenshot-based overlay (default, works everywhere)
 """
 
 import subprocess
 import tempfile
 import os
 import sys
+import argparse
 import urllib.parse
 
 import gi
@@ -17,6 +22,15 @@ from gi.repository import Gtk, Gdk, GdkPixbuf, GLib
 
 from PIL import Image
 
+# Layer shell support (optional - for live mode)
+LAYER_SHELL_AVAILABLE = False
+try:
+    gi.require_version('GtkLayerShell', '0.1')
+    from gi.repository import GtkLayerShell
+    LAYER_SHELL_AVAILABLE = True
+except (ValueError, ImportError):
+    pass
+
 # OCR support (optional)
 try:
     import pytesseract
@@ -25,8 +39,343 @@ except ImportError:
     OCR_AVAILABLE = False
 
 
+class LiveOverlay(Gtk.Window):
+    """Layer-shell based overlay for live screen selection (Hyprland/Sway only)"""
+    def __init__(self, callback):
+        super().__init__(title="Circle to Search")
+
+        self.callback = callback
+        self.points = []
+        self.drawing = False
+        self.selection_made = False
+        self.ctrl_held = False
+        self.shift_held = False
+        self.start_point = None
+        self.end_point = None
+
+        # Get screen dimensions
+        display = Gdk.Display.get_default()
+        monitor = display.get_primary_monitor() or display.get_monitor(0)
+        geometry = monitor.get_geometry()
+        self.scale_factor = monitor.get_scale_factor()
+
+        self.screen_width = geometry.width
+        self.screen_height = geometry.height
+
+        # Initialize layer shell
+        GtkLayerShell.init_for_window(self)
+        GtkLayerShell.set_layer(self, GtkLayerShell.Layer.OVERLAY)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.TOP, True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
+        GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
+        GtkLayerShell.set_exclusive_zone(self, -1)  # Cover entire screen
+        GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
+
+        # Make window transparent
+        self.set_decorated(False)
+        self.set_app_paintable(True)
+
+        screen = self.get_screen()
+        visual = screen.get_rgba_visual()
+        if visual:
+            self.set_visual(visual)
+
+        # Create drawing area
+        self.drawing_area = Gtk.DrawingArea()
+        self.drawing_area.set_size_request(self.screen_width, self.screen_height)
+        self.add(self.drawing_area)
+
+        # Connect signals
+        self.drawing_area.connect("draw", self.on_draw)
+        self.connect("button-press-event", self.on_button_press)
+        self.connect("button-release-event", self.on_button_release)
+        self.connect("motion-notify-event", self.on_motion)
+        self.connect("key-press-event", self.on_key_press)
+
+        self.add_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK |
+            Gdk.EventMask.BUTTON_RELEASE_MASK |
+            Gdk.EventMask.POINTER_MOTION_MASK |
+            Gdk.EventMask.KEY_PRESS_MASK |
+            Gdk.EventMask.KEY_RELEASE_MASK
+        )
+        self.connect("key-release-event", self.on_key_release)
+
+    def on_draw(self, widget, cr):
+        import math
+
+        # If in capture mode, draw nothing (fully transparent)
+        if getattr(self, '_capture_mode', False):
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.paint()
+            return False
+
+        # Transparent background - live desktop shows through!
+        cr.set_source_rgba(0.02, 0.02, 0.08, 0.4)
+        cr.paint()
+
+        # Gradient colors for the selection (purple -> pink -> cyan)
+        def draw_glow_stroke(path_func, line_width=4):
+            for glow_size, alpha in [(12, 0.15), (8, 0.25), (5, 0.4)]:
+                cr.set_line_width(line_width + glow_size)
+                cr.set_source_rgba(0.55, 0.23, 0.93, alpha)
+                path_func()
+                cr.stroke()
+
+            cr.set_line_width(line_width)
+            cr.set_source_rgba(0.66, 0.33, 0.97, 1.0)
+            path_func()
+            cr.stroke()
+
+            cr.set_line_width(line_width - 2)
+            cr.set_source_rgba(0.93, 0.47, 0.86, 0.6)
+            path_func()
+            cr.stroke()
+
+        if self.ctrl_held and self.start_point and self.end_point:
+            x1, y1 = self.start_point
+            x2, y2 = self.end_point
+
+            if self.shift_held:
+                cx = (x1 + x2) / 2
+                cy = (y1 + y2) / 2
+                rx = abs(x2 - x1) / 2
+                ry = abs(y2 - y1) / 2
+
+                def draw_ellipse():
+                    cr.save()
+                    cr.translate(cx, cy)
+                    if rx > 0 and ry > 0:
+                        cr.scale(rx, ry)
+                        cr.arc(0, 0, 1, 0, 2 * math.pi)
+                    cr.restore()
+
+                draw_glow_stroke(draw_ellipse)
+            else:
+                def draw_rect():
+                    cr.rectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
+
+                draw_glow_stroke(draw_rect)
+
+            for px, py in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.4)
+                cr.arc(px, py, 10, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                cr.arc(px, py, 5, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgba(1, 1, 1, 0.8)
+                cr.arc(px, py, 2, 0, 2 * math.pi)
+                cr.fill()
+
+        elif len(self.points) > 1:
+            def draw_path():
+                cr.move_to(self.points[0][0], self.points[0][1])
+                for point in self.points[1:]:
+                    cr.line_to(point[0], point[1])
+
+            draw_glow_stroke(draw_path, line_width=5)
+
+            for i, point in enumerate(self.points[::8]):
+                t = i / max(1, len(self.points[::8]) - 1)
+                r = 0.55 + 0.38 * t
+                g = 0.23 + 0.54 * t
+                b = 0.93 - 0.13 * t
+
+                cr.set_source_rgba(r, g, b, 0.4)
+                cr.arc(point[0], point[1], 8, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgba(r, g, b, 1.0)
+                cr.arc(point[0], point[1], 4, 0, 2 * math.pi)
+                cr.fill()
+
+        # Show help text
+        if not self.drawing and len(self.points) == 0 and not self.start_point:
+            cr.select_font_face("Sans", 0, 1)
+
+            text = "Draw a circle around the area to search"
+            cr.set_font_size(28)
+            extents = cr.text_extents(text)
+            x = (self.screen_width - extents.width) / 2
+            y = self.screen_height / 2 - 50
+
+            cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+            for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                cr.move_to(x + dx, y + dy)
+                cr.show_text(text)
+
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.move_to(x, y)
+            cr.show_text(text)
+
+            cr.set_font_size(16)
+            text2 = "LIVE MODE  •  CTRL = rectangle  •  CTRL+SHIFT = ellipse  •  ESC = cancel"
+            extents2 = cr.text_extents(text2)
+            x2 = (self.screen_width - extents2.width) / 2
+            cr.set_source_rgba(0.5, 0.93, 0.5, 0.9)
+            cr.move_to(x2, y + 45)
+            cr.show_text(text2)
+
+        return False
+
+    def on_button_press(self, widget, event):
+        if event.button == 1:
+            self.drawing = True
+            self.start_point = (event.x, event.y)
+            self.end_point = (event.x, event.y)
+            self.points = [(event.x, event.y)]
+            self.ctrl_held = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+            self.shift_held = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+        return True
+
+    def on_motion(self, widget, event):
+        if self.drawing:
+            self.end_point = (event.x, event.y)
+            if not self.ctrl_held:
+                self.points.append((event.x, event.y))
+            self.drawing_area.queue_draw()
+        return True
+
+    def on_button_release(self, widget, event):
+        if event.button == 1 and self.drawing:
+            self.drawing = False
+            if self.ctrl_held and self.start_point and self.end_point:
+                self.process_selection()
+            elif len(self.points) > 10:
+                self.process_selection()
+            else:
+                self.points = []
+                self.start_point = None
+                self.end_point = None
+                self.drawing_area.queue_draw()
+        return True
+
+    def on_key_press(self, widget, event):
+        if event.keyval == Gdk.KEY_Escape:
+            self.callback(None)
+            self.destroy()
+            Gtk.main_quit()
+        elif event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+            self.ctrl_held = True
+            self.drawing_area.queue_draw()
+        elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+            self.shift_held = True
+            self.drawing_area.queue_draw()
+        return True
+
+    def on_key_release(self, widget, event):
+        if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+            self.ctrl_held = False
+            self.drawing_area.queue_draw()
+        elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+            self.shift_held = False
+            self.drawing_area.queue_draw()
+        return True
+
+    def get_bounding_box(self):
+        if self.ctrl_held and self.start_point and self.end_point:
+            x1 = min(self.start_point[0], self.end_point[0])
+            y1 = min(self.start_point[1], self.end_point[1])
+            x2 = max(self.start_point[0], self.end_point[0])
+            y2 = max(self.start_point[1], self.end_point[1])
+            padding = 5
+            x1 = max(0, x1 - padding)
+            y1 = max(0, y1 - padding)
+            x2 = min(self.screen_width, x2 + padding)
+            y2 = min(self.screen_height, y2 + padding)
+            return (int(x1), int(y1), int(x2), int(y2))
+
+        if not self.points:
+            return None
+
+        xs = [p[0] for p in self.points]
+        ys = [p[1] for p in self.points]
+
+        padding = 10
+        x1 = max(0, min(xs) - padding)
+        y1 = max(0, min(ys) - padding)
+        x2 = min(self.screen_width, max(xs) + padding)
+        y2 = min(self.screen_height, max(ys) + padding)
+
+        return (int(x1), int(y1), int(x2), int(y2))
+
+    def process_selection(self):
+        if self.selection_made:
+            return
+        self.selection_made = True
+
+        bbox = self.get_bounding_box()
+        if not bbox:
+            self.callback(None)
+            self.destroy()
+            Gtk.main_quit()
+            return
+
+        x1, y1, x2, y2 = bbox
+        width = x2 - x1
+        height = y2 - y1
+
+        if width < 20 or height < 20:
+            self.callback(None)
+            self.destroy()
+            Gtk.main_quit()
+            return
+
+        # Clear the drawing and make overlay fully transparent before capture
+        self.points = []
+        self.start_point = None
+        self.end_point = None
+        self._capture_mode = True  # Flag to draw nothing
+        self.drawing_area.queue_draw()
+
+        # Process the redraw
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        # Store capture params
+        self._capture_params = (x1, y1, width, height)
+        self._callback = self.callback
+
+        # Small delay then capture
+        GLib.timeout_add(50, self._do_capture)
+
+    def _do_capture(self):
+        x, y, width, height = self._capture_params
+
+        # Now hide and take screenshot
+        self.hide()
+
+        # Process hide
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        import time
+        time.sleep(0.1)
+
+        # Take screenshot with unique filename to avoid caching issues
+        import uuid
+        temp_dir = tempfile.gettempdir()
+        cropped_path = os.path.join(temp_dir, f"circle_search_crop_{uuid.uuid4().hex[:8]}.png")
+        geometry = f"{int(x)},{int(y)} {int(width)}x{int(height)}"
+
+        result = subprocess.run(
+            ["grim", "-g", geometry, cropped_path],
+            capture_output=True
+        )
+
+        if result.returncode == 0:
+            self._callback(cropped_path)
+        else:
+            self._callback(None)
+
+        self.destroy()
+        Gtk.main_quit()
+        return False
+
+
 class CircleOverlay(Gtk.Window):
-    """Fullscreen overlay for drawing selection"""
+    """Fullscreen overlay for drawing selection (screenshot-based)"""
     def __init__(self, screenshot_path, callback):
         super().__init__(title="Circle to Search")
 
@@ -434,11 +783,14 @@ class ImagePreviewDialog(Gtk.Window):
         image.set_margin_start(12)
         image.set_margin_end(12)
 
-        alignment = Gtk.Alignment.new(0.5, 0.5, 0, 0)
-        alignment.add(image)
-        alignment.set_size_request(450, 280)
+        # Center image using Box instead of deprecated Alignment
+        image_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        image_box.set_halign(Gtk.Align.CENTER)
+        image_box.set_valign(Gtk.Align.CENTER)
+        image_box.pack_start(image, False, False, 0)
+        image_box.set_size_request(450, 280)
 
-        frame.add(alignment)
+        frame.add(image_box)
         vbox.pack_start(frame, True, True, 0)
 
         # Buttons container
@@ -829,28 +1181,81 @@ def copy_to_clipboard_text(text):
 
 
 def main():
-    # Take screenshot
-    screenshot_path = take_screenshot()
-    if not screenshot_path:
-        subprocess.run(["notify-send", "Error", "Failed to take screenshot"])
-        sys.exit(1)
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(
+        description="Circle to Search - Draw to select, search with Google Lens",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Modes:
+  --static   Screenshot-based overlay (default, works everywhere)
+  --live     Layer-shell overlay with live screen (Hyprland/Sway only)
 
-    # Phase 1: Circle selection
-    crop_path = [None]  # Use list to allow modification in callback
+Example keybindings for Hyprland:
+  bind = $mainMod, S, exec, circle-to-search.py --static
+  bind = $mainMod SHIFT, S, exec, circle-to-search.py --live
+        """
+    )
+    parser.add_argument('--live', action='store_true',
+                       help='Use layer-shell for live screen overlay (Hyprland/Sway only)')
+    parser.add_argument('--static', action='store_true',
+                       help='Use screenshot-based overlay (default)')
+    args = parser.parse_args()
+
+    use_live_mode = args.live
+
+    # Check if live mode is requested but not available
+    if use_live_mode and not LAYER_SHELL_AVAILABLE:
+        subprocess.run([
+            "notify-send", "-i", "dialog-warning",
+            "Live Mode Unavailable",
+            "gtk-layer-shell not found. Install with:\nsudo pacman -S gtk-layer-shell\n\nFalling back to static mode."
+        ])
+        use_live_mode = False
+
+    # Check if we're on a supported compositor for live mode
+    if use_live_mode:
+        # Check for wlroots-based compositor
+        wayland_display = os.environ.get('WAYLAND_DISPLAY', '')
+        xdg_session = os.environ.get('XDG_CURRENT_DESKTOP', '').lower()
+        hyprland = os.environ.get('HYPRLAND_INSTANCE_SIGNATURE', '')
+
+        is_supported = bool(hyprland) or 'sway' in xdg_session or 'hyprland' in xdg_session
+
+        if not is_supported:
+            subprocess.run([
+                "notify-send", "-i", "dialog-warning",
+                "Live Mode Unavailable",
+                f"Live mode requires Hyprland or Sway.\nDetected: {xdg_session or 'unknown'}\n\nFalling back to static mode."
+            ])
+            use_live_mode = False
+
+    crop_path = [None]
 
     def on_selection(path):
         crop_path[0] = path
 
-    overlay = CircleOverlay(screenshot_path, on_selection)
-    overlay.show_all()
-    GLib.timeout_add(100, lambda: overlay.present())
-    Gtk.main()
+    if use_live_mode:
+        # Live mode - no screenshot needed, overlay is transparent
+        overlay = LiveOverlay(on_selection)
+        overlay.show_all()
+        Gtk.main()
+    else:
+        # Static mode - take screenshot first
+        screenshot_path = take_screenshot()
+        if not screenshot_path:
+            subprocess.run(["notify-send", "Error", "Failed to take screenshot"])
+            sys.exit(1)
 
-    # Cleanup screenshot
-    try:
-        os.remove(screenshot_path)
-    except:
-        pass
+        overlay = CircleOverlay(screenshot_path, on_selection)
+        overlay.show_all()
+        GLib.timeout_add(100, lambda: overlay.present())
+        Gtk.main()
+
+        # Cleanup screenshot
+        try:
+            os.remove(screenshot_path)
+        except:
+            pass
 
     if not crop_path[0]:
         sys.exit(0)

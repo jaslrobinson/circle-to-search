@@ -12,7 +12,34 @@ A Linux utility that mimics Google's "Circle to Search" feature. Draw a selectio
 - **OCR Text Extraction**: Extract text from images using Tesseract
 - **Clipboard Support**: Selections are automatically copied to clipboard
 - **HiDPI Support**: Works correctly on high-DPI displays
-- **Dark Theme**: Modern dark UI using Catppuccin-inspired colors
+- **Dark Theme**: Modern dark UI with purple/pink neon glow effects
+
+## Selection Modes
+
+### Static Mode (Default)
+```bash
+./circle-to-search.py
+./circle-to-search.py --static
+```
+- Takes a screenshot first, then displays it as the overlay background
+- **Works on all Wayland compositors** (Hyprland, Sway, GNOME, KDE, etc.)
+- Screen content is frozen while you draw your selection
+- Most reliable option
+
+### Live Mode (Hyprland/Sway Only)
+```bash
+./circle-to-search.py --live
+```
+- Uses layer-shell to create a transparent overlay on the live desktop
+- **Requires**: Hyprland or Sway (wlroots-based compositors)
+- **Requires**: `gtk-layer-shell` package
+- See your actual live screen while drawing
+- Captures the selected region after you finish drawing
+
+#### Live Mode Limitations
+- Only works on wlroots-based compositors (Hyprland, Sway)
+- Windows may change appearance (e.g., transparency) when overlay takes focus
+- If `gtk-layer-shell` is not installed, falls back to static mode automatically
 
 ## Installation
 
@@ -34,6 +61,8 @@ chmod +x Circle_to_Search-x86_64.AppImage
 sudo pacman -S python python-pillow python-gobject gtk3 grim wl-clipboard
 # Optional for OCR:
 sudo pacman -S tesseract tesseract-data-eng python-pytesseract
+# Optional for live mode:
+sudo pacman -S gtk-layer-shell
 ```
 
 **Fedora:**
@@ -41,6 +70,8 @@ sudo pacman -S tesseract tesseract-data-eng python-pytesseract
 sudo dnf install python3 python3-pillow python3-gobject gtk3 grim wl-clipboard
 # Optional for OCR:
 sudo dnf install tesseract tesseract-langpack-eng python3-pytesseract
+# Optional for live mode:
+sudo dnf install gtk-layer-shell
 ```
 
 **Ubuntu/Debian (22.04+ with Wayland):**
@@ -48,12 +79,14 @@ sudo dnf install tesseract tesseract-langpack-eng python3-pytesseract
 sudo apt install python3 python3-pil python3-gi gir1.2-gtk-3.0 grim wl-clipboard
 # Optional for OCR:
 sudo apt install tesseract-ocr tesseract-ocr-eng python3-pytesseract
+# Optional for live mode:
+sudo apt install gtk-layer-shell
 ```
 
 #### Run
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/circle-to-search.git
+git clone https://github.com/jaslrobinson/circle-to-search.git
 cd circle-to-search
 chmod +x circle-to-search.py
 ./circle-to-search.py
@@ -64,11 +97,11 @@ chmod +x circle-to-search.py
 1. **Launch** the application (bind to a keyboard shortcut for best experience)
 2. **Draw** a circle/shape around the area you want to search
 3. **Choose** an action:
-   - **Search (Direct)**: Uploads to imgur and opens Google Lens automatically
-   - **Google Lens**: Opens Google Lens (paste image manually)
-   - **Extract Text (OCR)**: Extracts text using Tesseract
+   - **Search with Google Lens**: Uploads to imgur and opens Google Lens automatically
+   - **Manual Paste**: Opens Google Lens (paste image manually)
+   - **Extract Text**: Extracts text using Tesseract OCR
 
-### Keyboard Shortcuts
+### Keyboard Shortcuts (while drawing)
 
 | Key | Action |
 |-----|--------|
@@ -76,18 +109,26 @@ chmod +x circle-to-search.py
 | `Ctrl+Shift` + drag | Draw ellipse |
 | `Escape` | Cancel |
 
-### Recommended: Bind to Keyboard Shortcut
+### Recommended: Bind to Keyboard Shortcuts
 
-For the best experience, bind the script to a keyboard shortcut in your compositor:
+For the best experience, bind both modes to keyboard shortcuts:
 
 **Hyprland** (`~/.config/hyprland/hyprland.conf`):
 ```
-bind = $mainMod, S, exec, /path/to/circle-to-search.py
+# Static mode
+bind = $mainMod, S, exec, /path/to/circle-to-search.py --static
+
+# Live mode
+bind = $mainMod SHIFT, S, exec, /path/to/circle-to-search.py --live
 ```
 
 **Sway** (`~/.config/sway/config`):
 ```
-bindsym $mod+Shift+s exec /path/to/circle-to-search.py
+# Static mode
+bindsym $mod+s exec /path/to/circle-to-search.py --static
+
+# Live mode
+bindsym $mod+Shift+s exec /path/to/circle-to-search.py --live
 ```
 
 ## Building AppImage
@@ -110,11 +151,27 @@ This creates `Circle_to_Search-x86_64.AppImage` with all dependencies bundled.
 - **Wayland** compositor (Sway, Hyprland, GNOME Wayland, KDE Wayland, etc.)
 - This tool does **not** work on X11
 
+| Feature | Static Mode | Live Mode |
+|---------|-------------|-----------|
+| All Wayland compositors | Yes | No (Hyprland/Sway only) |
+| Live screen view | No (frozen screenshot) | Yes |
+| gtk-layer-shell required | No | Yes |
+| Window state preserved | Yes | No (may change focus/opacity) |
+
 ## How It Works
 
+### Static Mode
 1. Takes a fullscreen screenshot using `grim`
-2. Displays an overlay where you can draw your selection
-3. Crops the selected region
+2. Displays the screenshot as an overlay background
+3. You draw your selection on the frozen image
+4. Crops the selected region
+5. Copies the selection to clipboard via `wl-copy`
+6. Presents options: Google Lens search or OCR text extraction
+
+### Live Mode
+1. Creates a transparent layer-shell overlay above all windows
+2. You draw your selection while seeing the live desktop
+3. Overlay becomes fully transparent, then captures the region with `grim`
 4. Copies the selection to clipboard via `wl-copy`
 5. Presents options: Google Lens search or OCR text extraction
 
