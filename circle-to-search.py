@@ -84,8 +84,9 @@ class CircleOverlay(Gtk.Window):
         self.connect("key-release-event", self.on_key_release)
 
     def on_draw(self, widget, cr):
+        import math
+
         # Draw the screenshot as background, scaled to fit screen
-        # The screenshot is at native resolution, we need to scale it to logical resolution
         pixbuf_width = self.pixbuf.get_width()
         pixbuf_height = self.pixbuf.get_height()
 
@@ -95,15 +96,32 @@ class CircleOverlay(Gtk.Window):
         cr.scale(scale_x, scale_y)
         Gdk.cairo_set_source_pixbuf(cr, self.pixbuf, 0, 0)
         cr.paint()
-        cr.scale(1.0 / scale_x, 1.0 / scale_y)  # Reset scale for drawing
+        cr.scale(1.0 / scale_x, 1.0 / scale_y)
 
-        # Semi-transparent overlay
-        cr.set_source_rgba(0, 0, 0, 0.3)
+        # Semi-transparent dark overlay with subtle gradient
+        cr.set_source_rgba(0.02, 0.02, 0.08, 0.4)
         cr.paint()
 
-        # Draw the selection
-        cr.set_source_rgba(0.2, 0.6, 1.0, 0.8)
-        cr.set_line_width(4)
+        # Gradient colors for the selection (purple -> pink -> cyan)
+        def draw_glow_stroke(path_func, line_width=4):
+            # Outer glow layers
+            for glow_size, alpha in [(12, 0.15), (8, 0.25), (5, 0.4)]:
+                cr.set_line_width(line_width + glow_size)
+                cr.set_source_rgba(0.55, 0.23, 0.93, alpha)  # Purple glow
+                path_func()
+                cr.stroke()
+
+            # Main gradient stroke
+            cr.set_line_width(line_width)
+            cr.set_source_rgba(0.66, 0.33, 0.97, 1.0)  # Vibrant purple
+            path_func()
+            cr.stroke()
+
+            # Inner highlight
+            cr.set_line_width(line_width - 2)
+            cr.set_source_rgba(0.93, 0.47, 0.86, 0.6)  # Pink highlight
+            path_func()
+            cr.stroke()
 
         if self.ctrl_held and self.start_point and self.end_point:
             x1, y1 = self.start_point
@@ -116,55 +134,90 @@ class CircleOverlay(Gtk.Window):
                 rx = abs(x2 - x1) / 2
                 ry = abs(y2 - y1) / 2
 
-                cr.save()
-                cr.translate(cx, cy)
-                if rx > 0 and ry > 0:
-                    cr.scale(rx, ry)
-                    cr.arc(0, 0, 1, 0, 2 * 3.14159)
-                cr.restore()
-                cr.stroke()
+                def draw_ellipse():
+                    cr.save()
+                    cr.translate(cx, cy)
+                    if rx > 0 and ry > 0:
+                        cr.scale(rx, ry)
+                        cr.arc(0, 0, 1, 0, 2 * math.pi)
+                    cr.restore()
+
+                draw_glow_stroke(draw_ellipse)
             else:
                 # Draw rectangle (Ctrl only)
-                cr.rectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-                cr.stroke()
+                def draw_rect():
+                    cr.rectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
-            # Draw corner markers
-            cr.set_source_rgba(0.2, 0.6, 1.0, 1.0)
+                draw_glow_stroke(draw_rect)
+
+            # Draw glowing corner markers
             for px, py in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
-                cr.arc(px, py, 5, 0, 2 * 3.14159)
+                # Outer glow
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.4)
+                cr.arc(px, py, 10, 0, 2 * math.pi)
+                cr.fill()
+                # Inner bright circle
+                cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                cr.arc(px, py, 5, 0, 2 * math.pi)
+                cr.fill()
+                # Center highlight
+                cr.set_source_rgba(1, 1, 1, 0.8)
+                cr.arc(px, py, 2, 0, 2 * math.pi)
                 cr.fill()
 
         elif len(self.points) > 1:
-            # Draw freeform path
-            cr.move_to(self.points[0][0], self.points[0][1])
-            for point in self.points[1:]:
-                cr.line_to(point[0], point[1])
-            cr.stroke()
+            # Draw freeform path with glow
+            def draw_path():
+                cr.move_to(self.points[0][0], self.points[0][1])
+                for point in self.points[1:]:
+                    cr.line_to(point[0], point[1])
 
-            # Draw dots
-            cr.set_source_rgba(0.2, 0.6, 1.0, 1.0)
-            for point in self.points[::5]:
-                cr.arc(point[0], point[1], 3, 0, 2 * 3.14159)
+            draw_glow_stroke(draw_path, line_width=5)
+
+            # Draw gradient dots along the path
+            for i, point in enumerate(self.points[::8]):
+                t = i / max(1, len(self.points[::8]) - 1)
+                # Gradient from purple to pink to cyan
+                r = 0.55 + 0.38 * t
+                g = 0.23 + 0.54 * t
+                b = 0.93 - 0.13 * t
+
+                # Glow
+                cr.set_source_rgba(r, g, b, 0.4)
+                cr.arc(point[0], point[1], 8, 0, 2 * math.pi)
+                cr.fill()
+                # Dot
+                cr.set_source_rgba(r, g, b, 1.0)
+                cr.arc(point[0], point[1], 4, 0, 2 * math.pi)
                 cr.fill()
 
-        # Show help text
+        # Show help text with glow effect
         if not self.drawing and len(self.points) == 0 and not self.start_point:
-            cr.set_source_rgba(1, 1, 1, 0.9)
-            cr.select_font_face("Sans", 0, 1)
-            cr.set_font_size(24)
+            cr.select_font_face("Sans", 0, 1)  # Bold
 
             text = "Draw a circle around the area to search"
+            cr.set_font_size(28)
             extents = cr.text_extents(text)
             x = (self.screen_width - extents.width) / 2
             y = self.screen_height / 2 - 50
+
+            # Text glow
+            cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+            for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                cr.move_to(x + dx, y + dy)
+                cr.show_text(text)
+
+            # Main text
+            cr.set_source_rgba(1, 1, 1, 0.95)
             cr.move_to(x, y)
             cr.show_text(text)
 
             cr.set_font_size(16)
-            text2 = "CTRL = rectangle | CTRL+SHIFT = ellipse | ESC = cancel"
+            text2 = "CTRL = rectangle  •  CTRL+SHIFT = ellipse  •  ESC = cancel"
             extents2 = cr.text_extents(text2)
             x2 = (self.screen_width - extents2.width) / 2
-            cr.move_to(x2, y + 40)
+            cr.set_source_rgba(0.8, 0.8, 0.9, 0.8)
+            cr.move_to(x2, y + 45)
             cr.show_text(text2)
 
         return False
@@ -315,44 +368,72 @@ class ImagePreviewDialog(Gtk.Window):
         self.image_path = image_path
         self.result = None
 
-        self.set_default_size(500, 450)
+        self.set_default_size(520, 500)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_keep_above(True)
         self.set_resizable(True)
+        self.set_decorated(False)  # Remove window decorations for cleaner look
 
         # Dark theme
         self.apply_dark_theme()
 
-        # Main container
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_top(16)
-        vbox.set_margin_bottom(16)
-        vbox.set_margin_start(16)
-        vbox.set_margin_end(16)
-        self.add(vbox)
+        # Main container with rounded corners effect
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(main_box)
 
-        # Label
+        # Custom title bar
+        title_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        title_bar.set_size_request(-1, 40)
+        title_bar.get_style_context().add_class("titlebar")
+
+        # Title
+        title_label = Gtk.Label(label="  Circle to Search")
+        title_label.get_style_context().add_class("window-title")
+        title_label.set_halign(Gtk.Align.START)
+        title_bar.pack_start(title_label, True, True, 8)
+
+        # Close button
+        close_btn = Gtk.Button(label="✕")
+        close_btn.get_style_context().add_class("close-button")
+        close_btn.connect("clicked", lambda b: self.set_result(None))
+        close_btn.set_size_request(40, 40)
+        title_bar.pack_end(close_btn, False, False, 0)
+
+        main_box.pack_start(title_bar, False, False, 0)
+
+        # Content container
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        vbox.set_margin_top(20)
+        vbox.set_margin_bottom(24)
+        vbox.set_margin_start(24)
+        vbox.set_margin_end(24)
+        main_box.pack_start(vbox, True, True, 0)
+
+        # Section label
         label = Gtk.Label(label="Selection Preview")
         label.get_style_context().add_class("title")
         vbox.pack_start(label, False, False, 0)
 
         # Image preview in frame
         frame = Gtk.Frame()
-        frame.set_shadow_type(Gtk.ShadowType.IN)
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.get_style_context().add_class("image-frame")
 
-        # Load and display the cropped image (scale down for preview to avoid memory issues)
+        # Load and display the cropped image
         pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
-        max_size = 450
+        max_size = 420
         width = pixbuf.get_width()
         height = pixbuf.get_height()
-        # Always scale to fit preview, even for smaller images
         if width > max_size or height > max_size:
             scale = min(max_size / width, max_size / height)
-            pixbuf = pixbuf.scale_simple(int(width * scale), int(height * scale), GdkPixbuf.InterpType.NEAREST)
+            pixbuf = pixbuf.scale_simple(int(width * scale), int(height * scale), GdkPixbuf.InterpType.BILINEAR)
 
         image = Gtk.Image.new_from_pixbuf(pixbuf)
+        image.set_margin_top(12)
+        image.set_margin_bottom(12)
+        image.set_margin_start(12)
+        image.set_margin_end(12)
 
-        # Center the image using an alignment container
         alignment = Gtk.Alignment.new(0.5, 0.5, 0, 0)
         alignment.add(image)
         alignment.set_size_request(450, 280)
@@ -360,78 +441,148 @@ class ImagePreviewDialog(Gtk.Window):
         frame.add(alignment)
         vbox.pack_start(frame, True, True, 0)
 
-        # Buttons row 1 - Image search
-        hbox1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        hbox1.set_halign(Gtk.Align.CENTER)
-        vbox.pack_start(hbox1, False, False, 4)
+        # Buttons container
+        buttons_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.pack_start(buttons_box, False, False, 8)
 
-        btn_direct = Gtk.Button(label="Search (Direct)")
+        # Primary action button (full width)
+        btn_direct = Gtk.Button(label="🔍  Search with Google Lens")
         btn_direct.get_style_context().add_class("suggested-action")
+        btn_direct.get_style_context().add_class("primary-button")
         btn_direct.connect("clicked", lambda b: self.set_result("tineye"))
-        btn_direct.set_tooltip_text("Upload to imgur and open Google Lens with URL")
-        hbox1.pack_start(btn_direct, False, False, 0)
+        btn_direct.set_tooltip_text("Upload to imgur and open Google Lens automatically")
+        buttons_box.pack_start(btn_direct, False, False, 0)
 
-        btn_lens = Gtk.Button(label="Google Lens")
+        # Secondary buttons row
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.set_homogeneous(True)
+        buttons_box.pack_start(hbox, False, False, 0)
+
+        btn_lens = Gtk.Button(label="📋  Manual Paste")
         btn_lens.connect("clicked", lambda b: self.set_result("lens"))
         btn_lens.set_tooltip_text("Open Google Lens (paste image manually)")
-        hbox1.pack_start(btn_lens, False, False, 0)
+        hbox.pack_start(btn_lens, True, True, 0)
 
-        # Buttons row 2 - OCR and Cancel
-        hbox2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        hbox2.set_halign(Gtk.Align.CENTER)
-        vbox.pack_start(hbox2, False, False, 4)
-
-        btn_ocr = Gtk.Button(label="Extract Text (OCR)")
+        btn_ocr = Gtk.Button(label="📝  Extract Text")
         btn_ocr.connect("clicked", lambda b: self.set_result("ocr"))
         if not OCR_AVAILABLE:
             btn_ocr.set_sensitive(False)
             btn_ocr.set_tooltip_text("Install: sudo pacman -S python-pytesseract tesseract tesseract-data-eng")
-        hbox2.pack_start(btn_ocr, False, False, 0)
+        else:
+            btn_ocr.set_tooltip_text("Extract text using OCR")
+        hbox.pack_start(btn_ocr, True, True, 0)
 
-        btn_close = Gtk.Button(label="Cancel")
-        btn_close.connect("clicked", lambda b: self.set_result(None))
-        hbox2.pack_start(btn_close, False, False, 0)
+        # Make window draggable from title bar
+        title_bar.connect("button-press-event", self.on_title_bar_press)
 
         self.connect("key-press-event", self.on_key_press)
         self.connect("delete-event", lambda w, e: self.set_result(None) or False)
 
+    def on_title_bar_press(self, widget, event):
+        if event.button == 1:
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+        return True
+
     def apply_dark_theme(self):
         css = b"""
         window {
-            background-color: #1e1e2e;
+            background: #0d0d1a;
+            border-radius: 16px;
+        }
+        .titlebar {
+            background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
+            border-bottom: 1px solid rgba(139, 92, 246, 0.2);
+        }
+        label.window-title {
+            color: #a78bfa;
+            font-size: 14px;
+            font-weight: 600;
+            font-family: "Inter", "SF Pro Display", "Segoe UI", sans-serif;
+        }
+        .close-button {
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            color: #64748b;
+            font-size: 16px;
+            padding: 0;
+            box-shadow: none;
+        }
+        .close-button:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            box-shadow: none;
         }
         label {
-            color: #cdd6f4;
+            color: #e2e8f0;
+            font-family: "Inter", "SF Pro Display", "Segoe UI", sans-serif;
         }
         label.title {
             font-size: 16px;
-            font-weight: bold;
-            color: #cdd6f4;
+            font-weight: 600;
+            color: #c4b5fd;
+            letter-spacing: 0.3px;
         }
         button {
-            background: #313244;
-            color: #cdd6f4;
-            border: 1px solid #45475a;
-            padding: 8px 16px;
-            border-radius: 6px;
+            background: linear-gradient(135deg, #1e1e3f 0%, #2d2d5a 100%);
+            color: #e2e8f0;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-weight: 500;
+            font-size: 13px;
+            box-shadow: 0 4px 15px rgba(0, 0, 0, 0.3),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.1);
         }
         button:hover {
-            background: #45475a;
+            background: linear-gradient(135deg, #2d2d5a 0%, #3d3d7a 100%);
+            border-color: rgba(139, 92, 246, 0.6);
+            box-shadow: 0 6px 20px rgba(139, 92, 246, 0.25),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.15);
+        }
+        button:active {
+            background: linear-gradient(135deg, #1a1a3a 0%, #2a2a5a 100%);
         }
         button.suggested-action {
-            background: #89b4fa;
-            color: #1e1e2e;
+            background: linear-gradient(135deg, #7c3aed 0%, #a855f7 50%, #c026d3 100%);
+            color: #ffffff;
+            border: none;
+            font-weight: 600;
+            box-shadow: 0 4px 20px rgba(168, 85, 247, 0.4),
+                        inset 0 1px 0 rgba(255, 255, 255, 0.2);
         }
         button.suggested-action:hover {
-            background: #b4befe;
+            background: linear-gradient(135deg, #8b5cf6 0%, #c084fc 50%, #d946ef 100%);
+            box-shadow: 0 6px 25px rgba(168, 85, 247, 0.5);
+        }
+        button.primary-button {
+            padding: 14px 24px;
+            font-size: 14px;
+            border-radius: 12px;
+        }
+        .image-frame {
+            background: rgba(10, 10, 25, 0.9);
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            border-radius: 12px;
+            box-shadow: inset 0 2px 8px rgba(0, 0, 0, 0.3);
         }
         frame {
-            background: #181825;
-            border: 1px solid #313244;
-            border-radius: 8px;
+            background: rgba(15, 15, 35, 0.8);
+            border: 1px solid rgba(139, 92, 246, 0.2);
+            border-radius: 12px;
         }
         scrolledwindow {
-            background: #181825;
+            background: rgba(15, 15, 35, 0.6);
+            border-radius: 10px;
+        }
+        textview {
+            background: rgba(10, 10, 25, 0.9);
+            color: #e2e8f0;
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+        }
+        textview text {
+            background: transparent;
+            color: #e2e8f0;
         }
         """
         style_provider = Gtk.CssProvider()
@@ -460,55 +611,187 @@ class TextResultDialog(Gtk.Window):
         self.result = None
         self.final_text = text
 
-        self.set_default_size(500, 350)
+        self.set_default_size(520, 420)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_keep_above(True)
+        self.set_decorated(False)
 
-        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
-        vbox.set_margin_top(16)
-        vbox.set_margin_bottom(16)
-        vbox.set_margin_start(16)
-        vbox.set_margin_end(16)
-        self.add(vbox)
+        # Apply theme (reuse from ImagePreviewDialog)
+        self.apply_dark_theme()
 
-        label = Gtk.Label(label="Extracted Text (copied to clipboard)")
-        label.get_style_context().add_class("title")
-        vbox.pack_start(label, False, False, 0)
+        # Main container
+        main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
+        self.add(main_box)
+
+        # Custom title bar
+        title_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        title_bar.set_size_request(-1, 40)
+        title_bar.get_style_context().add_class("titlebar")
+
+        title_label = Gtk.Label(label="  Extracted Text")
+        title_label.get_style_context().add_class("window-title")
+        title_label.set_halign(Gtk.Align.START)
+        title_bar.pack_start(title_label, True, True, 8)
+
+        close_btn = Gtk.Button(label="✕")
+        close_btn.get_style_context().add_class("close-button")
+        close_btn.connect("clicked", lambda b: self.set_result(None))
+        close_btn.set_size_request(40, 40)
+        title_bar.pack_end(close_btn, False, False, 0)
+
+        main_box.pack_start(title_bar, False, False, 0)
+
+        # Content
+        vbox = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        vbox.set_margin_top(20)
+        vbox.set_margin_bottom(24)
+        vbox.set_margin_start(24)
+        vbox.set_margin_end(24)
+        main_box.pack_start(vbox, True, True, 0)
+
+        # Status label
+        status_label = Gtk.Label(label="✓ Copied to clipboard")
+        status_label.get_style_context().add_class("title")
+        vbox.pack_start(status_label, False, False, 0)
 
         # Scrolled text view
         frame = Gtk.Frame()
-        frame.set_shadow_type(Gtk.ShadowType.IN)
+        frame.set_shadow_type(Gtk.ShadowType.NONE)
+        frame.get_style_context().add_class("image-frame")
+
         scrolled = Gtk.ScrolledWindow()
         scrolled.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scrolled.set_min_content_height(180)
+        scrolled.set_min_content_height(200)
 
         self.textview = Gtk.TextView()
         self.textview.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
         self.textview.set_editable(True)
+        self.textview.set_left_margin(12)
+        self.textview.set_right_margin(12)
+        self.textview.set_top_margin(12)
+        self.textview.set_bottom_margin(12)
         self.textview.get_buffer().set_text(text)
         scrolled.add(self.textview)
         frame.add(scrolled)
         vbox.pack_start(frame, True, True, 0)
 
         # Buttons
-        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        hbox.set_halign(Gtk.Align.CENTER)
-        vbox.pack_start(hbox, False, False, 8)
+        buttons_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        vbox.pack_start(buttons_box, False, False, 8)
 
-        btn_search = Gtk.Button(label="Search Google")
+        btn_search = Gtk.Button(label="🔍  Search Google")
         btn_search.get_style_context().add_class("suggested-action")
+        btn_search.get_style_context().add_class("primary-button")
         btn_search.connect("clicked", lambda b: self.set_result("search"))
-        hbox.pack_start(btn_search, False, False, 0)
+        buttons_box.pack_start(btn_search, False, False, 0)
 
-        btn_copy = Gtk.Button(label="Copy & Close")
+        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox.set_homogeneous(True)
+        buttons_box.pack_start(hbox, False, False, 0)
+
+        btn_copy = Gtk.Button(label="📋  Copy & Close")
         btn_copy.connect("clicked", lambda b: self.set_result("copy"))
-        hbox.pack_start(btn_copy, False, False, 0)
+        hbox.pack_start(btn_copy, True, True, 0)
 
-        btn_close = Gtk.Button(label="Close")
+        btn_close = Gtk.Button(label="Cancel")
         btn_close.connect("clicked", lambda b: self.set_result(None))
-        hbox.pack_start(btn_close, False, False, 0)
+        hbox.pack_start(btn_close, True, True, 0)
 
+        title_bar.connect("button-press-event", self.on_title_bar_press)
         self.connect("key-press-event", self.on_key_press)
+
+    def on_title_bar_press(self, widget, event):
+        if event.button == 1:
+            self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
+        return True
+
+    def apply_dark_theme(self):
+        css = b"""
+        window {
+            background: #0d0d1a;
+            border-radius: 16px;
+        }
+        .titlebar {
+            background: linear-gradient(90deg, #1a1a2e 0%, #16213e 100%);
+            border-bottom: 1px solid rgba(139, 92, 246, 0.2);
+        }
+        label.window-title {
+            color: #a78bfa;
+            font-size: 14px;
+            font-weight: 600;
+        }
+        .close-button {
+            background: transparent;
+            border: none;
+            border-radius: 0;
+            color: #64748b;
+            font-size: 16px;
+            padding: 0;
+            box-shadow: none;
+        }
+        .close-button:hover {
+            background: rgba(239, 68, 68, 0.2);
+            color: #ef4444;
+            box-shadow: none;
+        }
+        label {
+            color: #e2e8f0;
+        }
+        label.title {
+            font-size: 14px;
+            font-weight: 500;
+            color: #86efac;
+        }
+        button {
+            background: linear-gradient(135deg, #1e1e3f 0%, #2d2d5a 100%);
+            color: #e2e8f0;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-weight: 500;
+            font-size: 13px;
+        }
+        button:hover {
+            background: linear-gradient(135deg, #2d2d5a 0%, #3d3d7a 100%);
+            border-color: rgba(139, 92, 246, 0.6);
+        }
+        button.suggested-action {
+            background: linear-gradient(135deg, #7c3aed 0%, #a855f7 50%, #c026d3 100%);
+            color: #ffffff;
+            border: none;
+            font-weight: 600;
+        }
+        button.suggested-action:hover {
+            background: linear-gradient(135deg, #8b5cf6 0%, #c084fc 50%, #d946ef 100%);
+        }
+        button.primary-button {
+            padding: 14px 24px;
+            font-size: 14px;
+            border-radius: 12px;
+        }
+        .image-frame {
+            background: rgba(10, 10, 25, 0.9);
+            border: 1px solid rgba(139, 92, 246, 0.25);
+            border-radius: 12px;
+        }
+        textview {
+            background: transparent;
+            color: #e2e8f0;
+            font-family: "JetBrains Mono", "Fira Code", monospace;
+            font-size: 13px;
+        }
+        textview text {
+            background: transparent;
+            color: #e2e8f0;
+        }
+        """
+        style_provider = Gtk.CssProvider()
+        style_provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            style_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
     def get_text(self):
         buffer = self.textview.get_buffer()
