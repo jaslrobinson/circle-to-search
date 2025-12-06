@@ -1028,26 +1028,48 @@ class TextResultDialog(Gtk.Window):
         vbox.pack_start(frame, True, True, 0)
 
         # Buttons
-        buttons_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        buttons_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         vbox.pack_start(buttons_box, False, False, 8)
 
+        # Row 1: Search
         btn_search = Gtk.Button(label="🔍  Search Google")
         btn_search.get_style_context().add_class("suggested-action")
         btn_search.get_style_context().add_class("primary-button")
         btn_search.connect("clicked", lambda b: self.set_result("search"))
         buttons_box.pack_start(btn_search, False, False, 0)
 
-        hbox = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        hbox.set_homogeneous(True)
-        buttons_box.pack_start(hbox, False, False, 0)
+        # Row 2: Translate, Calculate, AI Explain
+        hbox1 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        hbox1.set_homogeneous(True)
+        buttons_box.pack_start(hbox1, False, False, 0)
+
+        btn_translate = Gtk.Button(label="🌐  Translate")
+        btn_translate.connect("clicked", lambda b: self.set_result("translate"))
+        btn_translate.set_tooltip_text("Open Google Translate")
+        hbox1.pack_start(btn_translate, True, True, 0)
+
+        btn_calculate = Gtk.Button(label="🧮  Calculate")
+        btn_calculate.connect("clicked", lambda b: self.set_result("calculate"))
+        btn_calculate.set_tooltip_text("Evaluate as math expression")
+        hbox1.pack_start(btn_calculate, True, True, 0)
+
+        btn_ai = Gtk.Button(label="🤖  AI Explain")
+        btn_ai.connect("clicked", lambda b: self.set_result("ai_explain"))
+        btn_ai.set_tooltip_text("Explain with AI (opens browser)")
+        hbox1.pack_start(btn_ai, True, True, 0)
+
+        # Row 3: Copy & Close, Cancel
+        hbox2 = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        hbox2.set_homogeneous(True)
+        buttons_box.pack_start(hbox2, False, False, 0)
 
         btn_copy = Gtk.Button(label="📋  Copy & Close")
         btn_copy.connect("clicked", lambda b: self.set_result("copy"))
-        hbox.pack_start(btn_copy, True, True, 0)
+        hbox2.pack_start(btn_copy, True, True, 0)
 
         btn_close = Gtk.Button(label="Cancel")
         btn_close.connect("clicked", lambda b: self.set_result(None))
-        hbox.pack_start(btn_close, True, True, 0)
+        hbox2.pack_start(btn_close, True, True, 0)
 
         title_bar.connect("button-press-event", self.on_title_bar_press)
         self.connect("key-press-event", self.on_key_press)
@@ -1336,6 +1358,40 @@ except Exception as e:
                 if text_result == "search":
                     search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(final_text)}"
                     subprocess.Popen(["xdg-open", search_url],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif text_result == "translate":
+                    translate_url = f"https://translate.google.com/?sl=auto&tl=en&text={urllib.parse.quote_plus(final_text)}"
+                    subprocess.Popen(["xdg-open", translate_url],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif text_result == "calculate":
+                    try:
+                        # Clean up text for calculation
+                        expr = final_text.strip()
+                        # Replace common text representations
+                        expr = expr.replace('×', '*').replace('÷', '/').replace('^', '**')
+                        expr = expr.replace('x', '*').replace('X', '*')
+                        # Only allow safe characters for eval
+                        allowed = set('0123456789+-*/.() ')
+                        if all(c in allowed for c in expr):
+                            result = eval(expr)
+                            copy_to_clipboard_text(str(result))
+                            subprocess.run(["notify-send", "Calculate Result",
+                                           f"{expr} = {result}\n\nCopied to clipboard"])
+                        else:
+                            # If complex expression, use Google Calculator
+                            calc_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(final_text)}"
+                            subprocess.Popen(["xdg-open", calc_url],
+                                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    except:
+                        # Fallback to Google Calculator
+                        calc_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(final_text)}"
+                        subprocess.Popen(["xdg-open", calc_url],
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                elif text_result == "ai_explain":
+                    # Open ChatGPT with the text as a prompt
+                    prompt = f"Explain this: {final_text}"
+                    ai_url = f"https://chatgpt.com/?q={urllib.parse.quote_plus(prompt)}"
+                    subprocess.Popen(["xdg-open", ai_url],
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 elif text_result == "copy":
                     copy_to_clipboard_text(final_text)
