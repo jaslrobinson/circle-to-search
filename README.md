@@ -130,6 +130,12 @@ bindsym $mod+s exec /path/to/circle-to-search.py --static
 # Live mode
 bindsym $mod+Shift+s exec /path/to/circle-to-search.py --live
 ```
+Users can now install it with:
+yay -S circle-to-search
+
+or
+paru -S circle-to-search
+
 
 ## Building AppImage
 
