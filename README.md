@@ -10,6 +10,7 @@ A Linux utility that mimics Google's "Circle to Search" feature. Draw a selectio
 - **Rectangle/Ellipse Mode**: Hold `Ctrl` for rectangles, `Ctrl+Shift` for ellipses
 - **Google Lens Integration**: Upload selection and search directly with Google Lens
 - **OCR Text Extraction**: Extract text from images using Tesseract
+- **Multi-Desktop Support**: Works on Hyprland, Sway, KDE Plasma, GNOME, and more
 - **Clipboard Support**: Selections are automatically copied to clipboard
 - **HiDPI Support**: Works correctly on high-DPI displays
 - **Dark Theme**: Modern dark UI with purple/pink neon glow effects
@@ -167,7 +168,7 @@ This creates `Circle_to_Search-x86_64.AppImage` with all dependencies bundled.
 ## How It Works
 
 ### Static Mode
-1. Takes a fullscreen screenshot using `grim`
+1. Takes a fullscreen screenshot (auto-detects: `grim`, `spectacle`, or `gnome-screenshot`)
 2. Displays the screenshot as an overlay background
 3. You draw your selection on the frozen image
 4. Crops the selected region
@@ -177,9 +178,19 @@ This creates `Circle_to_Search-x86_64.AppImage` with all dependencies bundled.
 ### Live Mode
 1. Creates a transparent layer-shell overlay above all windows
 2. You draw your selection while seeing the live desktop
-3. Overlay becomes fully transparent, then captures the region with `grim`
+3. Overlay becomes fully transparent, then captures the region
 4. Copies the selection to clipboard via `wl-copy`
 5. Presents options: Google Lens search or OCR text extraction
+
+### Screenshot Tool Support
+
+The app automatically detects and uses the appropriate screenshot tool:
+
+| Tool | Desktop Environment |
+|------|---------------------|
+| `grim` | Hyprland, Sway (wlroots) |
+| `spectacle` | KDE Plasma |
+| `gnome-screenshot` | GNOME |
 
 ## License
 

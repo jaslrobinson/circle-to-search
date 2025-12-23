@@ -1,1 +1,4 @@
-AppImage built, pushed to github.com/jaslrobinson/circle-to-search, needs release upload
+v1.2.0 Release:
+- Added KDE Plasma support (spectacle)
+- Added GNOME support (gnome-screenshot)
+- Auto-detects screenshot tool based on desktop environment

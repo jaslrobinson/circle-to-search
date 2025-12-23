@@ -6,6 +6,11 @@ Draw to select, then show GTK preview dialog
 Modes:
   --live     Use layer-shell for live screen overlay (Hyprland/Sway only)
   --static   Use screenshot-based overlay (default, works everywhere)
+
+Screenshot support:
+  - grim: For wlroots-based compositors (Hyprland, Sway, etc.)
+  - spectacle: For KDE Plasma
+  - gnome-screenshot: For GNOME
 """
 
 import subprocess
@@ -14,6 +19,9 @@ import os
 import sys
 import argparse
 import urllib.parse
+import threading
+import json
+from pathlib import Path
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -38,6 +46,9 @@ try:
 except ImportError:
     OCR_AVAILABLE = False
 
+# Numpy for edge detection
+import numpy as np
+
 
 class LiveOverlay(Gtk.Window):
     """Layer-shell based overlay for live screen selection (Hyprland/Sway only)"""
@@ -50,8 +61,41 @@ class LiveOverlay(Gtk.Window):
         self.selection_made = False
         self.ctrl_held = False
         self.shift_held = False
+        self.alt_held = False
         self.start_point = None
         self.end_point = None
+
+        # Edit mode - for adjusting points after tracing
+        self.edit_mode = False
+        self.dragging_point_idx = None
+        self.hover_point_idx = None
+        self.simplified_points = []
+
+        # Swipe detection for adjusting point count
+        self.swipe_start_y = None
+        self.swipe_accumulated = 0
+        self.swipe_threshold = 80
+        self.original_contour_points = None
+
+        # Undo history for point movements
+        self.point_history = []
+
+        # Connect-the-dots mode
+        self.dot_mode = False
+        self.dot_points = []
+
+        # Mode selector
+        self.mode_selector_active = False
+        self.selected_mode = 'freehand'
+        self.hovered_button = None
+
+        # Define mode buttons
+        self.mode_buttons = [
+            {'id': 'dots', 'label': 'Connect Dots', 'desc': 'Click to place points'},
+            {'id': 'freehand', 'label': 'Freehand', 'desc': 'Draw freely'},
+            {'id': 'rectangle', 'label': 'Rectangle', 'desc': 'Drag box shape'},
+        ]
+        self.button_rects = []
 
         # Get screen dimensions
         display = Gdk.Display.get_default()
@@ -69,7 +113,7 @@ class LiveOverlay(Gtk.Window):
         GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.BOTTOM, True)
         GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.LEFT, True)
         GtkLayerShell.set_anchor(self, GtkLayerShell.Edge.RIGHT, True)
-        GtkLayerShell.set_exclusive_zone(self, -1)  # Cover entire screen
+        GtkLayerShell.set_exclusive_zone(self, -1)
         GtkLayerShell.set_keyboard_mode(self, GtkLayerShell.KeyboardMode.EXCLUSIVE)
 
         # Make window transparent
@@ -133,30 +177,84 @@ class LiveOverlay(Gtk.Window):
             path_func()
             cr.stroke()
 
+        # Mode selector UI
+        if self.mode_selector_active:
+            # Draw mode selector buttons
+            button_width = 140
+            button_height = 70
+            button_spacing = 20
+            total_width = len(self.mode_buttons) * button_width + (len(self.mode_buttons) - 1) * button_spacing
+            start_x = (self.screen_width - total_width) / 2
+            start_y = self.screen_height / 2 - button_height / 2
+
+            self.button_rects = []
+            for i, btn in enumerate(self.mode_buttons):
+                x = start_x + i * (button_width + button_spacing)
+                y = start_y
+                is_hovered = self.hovered_button == btn['id']
+
+                # Button background
+                if is_hovered:
+                    cr.set_source_rgba(0.55, 0.23, 0.93, 0.6)
+                else:
+                    cr.set_source_rgba(0.1, 0.1, 0.2, 0.8)
+                cr.rectangle(x, y, button_width, button_height)
+                cr.fill()
+
+                # Button border
+                cr.set_line_width(2)
+                if is_hovered:
+                    cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                else:
+                    cr.set_source_rgba(0.55, 0.23, 0.93, 0.6)
+                cr.rectangle(x, y, button_width, button_height)
+                cr.stroke()
+
+                # Button label
+                cr.select_font_face("Sans", 0, 1)
+                cr.set_font_size(14)
+                cr.set_source_rgba(1, 1, 1, 0.95)
+                label_extents = cr.text_extents(btn['label'])
+                cr.move_to(x + (button_width - label_extents.width) / 2, y + 28)
+                cr.show_text(btn['label'])
+
+                # Button description
+                cr.set_font_size(11)
+                cr.set_source_rgba(0.8, 0.8, 0.9, 0.7)
+                desc_extents = cr.text_extents(btn['desc'])
+                cr.move_to(x + (button_width - desc_extents.width) / 2, y + 48)
+                cr.show_text(btn['desc'])
+
+                self.button_rects.append({'id': btn['id'], 'x': x, 'y': y, 'w': button_width, 'h': button_height})
+
+            # Title
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(24)
+            title = "Select Mode"
+            title_extents = cr.text_extents(title)
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.move_to((self.screen_width - title_extents.width) / 2, start_y - 40)
+            cr.show_text(title)
+
+            # Instructions
+            cr.set_font_size(14)
+            inst = "LIVE MODE  •  M = close  •  ESC = cancel"
+            inst_extents = cr.text_extents(inst)
+            cr.set_source_rgba(0.5, 0.93, 0.5, 0.8)
+            cr.move_to((self.screen_width - inst_extents.width) / 2, start_y + button_height + 40)
+            cr.show_text(inst)
+
+            return False
+
+        # Draw rectangle if in ctrl mode
         if self.ctrl_held and self.start_point and self.end_point:
             x1, y1 = self.start_point
             x2, y2 = self.end_point
 
-            if self.shift_held:
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-                rx = abs(x2 - x1) / 2
-                ry = abs(y2 - y1) / 2
+            def draw_rect():
+                cr.rectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
 
-                def draw_ellipse():
-                    cr.save()
-                    cr.translate(cx, cy)
-                    if rx > 0 and ry > 0:
-                        cr.scale(rx, ry)
-                        cr.arc(0, 0, 1, 0, 2 * math.pi)
-                    cr.restore()
-
-                draw_glow_stroke(draw_ellipse)
-            else:
-                def draw_rect():
-                    cr.rectangle(min(x1, x2), min(y1, y2), abs(x2 - x1), abs(y2 - y1))
-
-                draw_glow_stroke(draw_rect)
+            draw_glow_stroke(draw_rect)
 
             for px, py in [(x1, y1), (x2, y1), (x1, y2), (x2, y2)]:
                 cr.set_source_rgba(0.55, 0.23, 0.93, 0.4)
@@ -169,6 +267,40 @@ class LiveOverlay(Gtk.Window):
                 cr.arc(px, py, 2, 0, 2 * math.pi)
                 cr.fill()
 
+        # Draw dot mode points
+        elif self.dot_mode and self.dot_points and not self.edit_mode:
+            # Draw connecting lines
+            if len(self.dot_points) > 1:
+                def draw_dot_lines():
+                    cr.move_to(self.dot_points[0][0], self.dot_points[0][1])
+                    for point in self.dot_points[1:]:
+                        cr.line_to(point[0], point[1])
+                draw_glow_stroke(draw_dot_lines, line_width=3)
+
+            # Draw numbered dots - scale size based on point count
+            num_dots = len(self.dot_points)
+            # Scale from 18 (at 3 points) down to 8 (at 50+ points)
+            outer_radius = max(8, 18 - (num_dots - 3) * 10 / 47)
+            inner_radius = outer_radius * 0.67
+            font_size = max(8, 12 - (num_dots - 3) * 4 / 47)
+
+            for i, (px, py) in enumerate(self.dot_points):
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.6)
+                cr.arc(px, py, outer_radius, 0, 2 * math.pi)
+                cr.fill()
+                cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                cr.arc(px, py, inner_radius, 0, 2 * math.pi)
+                cr.fill()
+                # Number
+                cr.select_font_face("Sans", 0, 1)
+                cr.set_font_size(font_size)
+                cr.set_source_rgba(1, 1, 1, 0.95)
+                num_str = str(i + 1)
+                extents = cr.text_extents(num_str)
+                cr.move_to(px - extents.width / 2, py + extents.height / 2 - 1)
+                cr.show_text(num_str)
+
+        # Draw freehand points
         elif len(self.points) > 1:
             def draw_path():
                 cr.move_to(self.points[0][0], self.points[0][1])
@@ -190,11 +322,70 @@ class LiveOverlay(Gtk.Window):
                 cr.arc(point[0], point[1], 4, 0, 2 * math.pi)
                 cr.fill()
 
-        # Show help text
-        if not self.drawing and len(self.points) == 0 and not self.start_point:
-            cr.select_font_face("Sans", 0, 1)
+        # Edit mode - show control points
+        if self.edit_mode and self.simplified_points:
+            # Draw the shape outline
+            if len(self.simplified_points) > 1:
+                def draw_edit_path():
+                    cr.move_to(self.simplified_points[0][0], self.simplified_points[0][1])
+                    for point in self.simplified_points[1:]:
+                        cr.line_to(point[0], point[1])
+                    cr.close_path()
+                draw_glow_stroke(draw_edit_path, line_width=3)
 
-            text = "Draw a circle around the area to search"
+            # Draw control points - scale size based on point count
+            num_points = len(self.simplified_points)
+            # Scale from 10 (at 8 points) down to 4 (at 200 points)
+            base_size = max(4, 10 - (num_points - 8) * 6 / 192)
+            hover_size = base_size * 1.4
+            inner_size = base_size * 0.4
+            glow_size = base_size * 1.4  # Outer glow scales too
+
+            for i, (px, py) in enumerate(self.simplified_points):
+                is_hover = (i == self.hover_point_idx)
+                is_dragging = (i == self.dragging_point_idx)
+                current_size = hover_size if (is_hover or is_dragging) else base_size
+                current_inner = inner_size * 1.5 if (is_hover or is_dragging) else inner_size
+                current_glow = glow_size * 1.3 if (is_hover or is_dragging) else glow_size
+
+                # Outer glow
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.4)
+                cr.arc(px, py, current_glow, 0, 2 * math.pi)
+                cr.fill()
+                # Main circle
+                if is_dragging:
+                    cr.set_source_rgba(0.93, 0.8, 0.2, 1.0)
+                elif is_hover:
+                    cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                else:
+                    cr.set_source_rgba(0.66, 0.33, 0.97, 1.0)
+                cr.arc(px, py, current_size, 0, 2 * math.pi)
+                cr.fill()
+                # Inner circle
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.arc(px, py, current_inner, 0, 2 * math.pi)
+                cr.fill()
+
+            # Show edit mode instructions
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(18)
+            text = f"Drag points  •  ↑↓ = ±points ({len(self.simplified_points)})  •  ENTER = confirm"
+            extents = cr.text_extents(text)
+            x = (self.screen_width - extents.width) / 2
+            y = 50
+
+            cr.set_source_rgba(0, 0, 0, 0.7)
+            cr.rectangle(x - 20, y - 25, extents.width + 40, 40)
+            cr.fill()
+
+            cr.set_source_rgba(0.4, 1, 0.6, 1)
+            cr.move_to(x, y)
+            cr.show_text(text)
+
+        # Show help for dot mode
+        elif self.dot_mode and not self.dot_points and not self.edit_mode:
+            cr.select_font_face("Sans", 0, 1)
+            text = "Click to place points"
             cr.set_font_size(28)
             extents = cr.text_extents(text)
             x = (self.screen_width - extents.width) / 2
@@ -210,27 +401,161 @@ class LiveOverlay(Gtk.Window):
             cr.show_text(text)
 
             cr.set_font_size(16)
-            text2 = "LIVE MODE  •  CTRL = rectangle  •  CTRL+SHIFT = ellipse  •  ESC = cancel"
+            text2 = "LIVE MODE  •  ENTER = finish  •  BACKSPACE = undo  •  M = modes  •  ESC = cancel"
             extents2 = cr.text_extents(text2)
             x2 = (self.screen_width - extents2.width) / 2
             cr.set_source_rgba(0.5, 0.93, 0.5, 0.9)
             cr.move_to(x2, y + 45)
             cr.show_text(text2)
 
+        # Show help for other modes
+        elif self.selected_mode and not self.edit_mode and not self.drawing and len(self.points) == 0:
+            cr.select_font_face("Sans", 0, 1)
+
+            if self.selected_mode == 'freehand':
+                text = "Draw around the object"
+                text2 = "LIVE MODE  •  Hold mouse and draw  •  ENTER = full image  •  M = modes  •  ESC = cancel"
+            elif self.selected_mode == 'rectangle':
+                text = "Drag to draw a rectangle"
+                text2 = "LIVE MODE  •  Click and drag  •  ESC = cancel"
+            else:
+                text = ""
+                text2 = ""
+
+            if text:
+                cr.set_font_size(28)
+                extents = cr.text_extents(text)
+                x = (self.screen_width - extents.width) / 2
+                y = self.screen_height / 2 - 50
+
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+                for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                    cr.move_to(x + dx, y + dy)
+                    cr.show_text(text)
+
+                cr.set_source_rgba(1, 1, 1, 0.95)
+                cr.move_to(x, y)
+                cr.show_text(text)
+
+                cr.set_font_size(16)
+                extents2 = cr.text_extents(text2)
+                x2 = (self.screen_width - extents2.width) / 2
+                cr.set_source_rgba(0.5, 0.93, 0.5, 0.9)
+                cr.move_to(x2, y + 45)
+                cr.show_text(text2)
+
         return False
 
     def on_button_press(self, widget, event):
+        # Mode selector: check if clicking on a button
+        if self.mode_selector_active and event.button == 1:
+            if hasattr(self, 'button_rects'):
+                for btn in self.button_rects:
+                    if (btn['x'] <= event.x <= btn['x'] + btn['w'] and
+                        btn['y'] <= event.y <= btn['y'] + btn['h']):
+                        self.select_mode(btn['id'])
+                        return True
+            return True
+
+        # Connect-the-dots mode: click to place points
+        if self.dot_mode and not self.edit_mode:
+            if event.button == 1:
+                self.dot_points.append((event.x, event.y))
+                self.drawing_area.queue_draw()
+                return True
+            elif event.button == 3:
+                if self.dot_points:
+                    self.dot_points.pop()
+                    self.drawing_area.queue_draw()
+                return True
+
         if event.button == 1:
-            self.drawing = True
-            self.start_point = (event.x, event.y)
-            self.end_point = (event.x, event.y)
-            self.points = [(event.x, event.y)]
-            self.ctrl_held = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
-            self.shift_held = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+            if self.edit_mode:
+                # Check if clicking on a control point
+                for i, (px, py) in enumerate(self.simplified_points):
+                    dist = ((event.x - px) ** 2 + (event.y - py) ** 2) ** 0.5
+                    if dist < 20:
+                        self.dragging_point_idx = i
+                        self.point_history.append((i, (px, py)))
+                        self.drawing_area.queue_draw()
+                        return True
+                # Start swipe detection
+                self.swipe_start_y = event.y
+                self.swipe_accumulated = 0
+            else:
+                self.drawing = True
+                self.start_point = (event.x, event.y)
+                self.end_point = (event.x, event.y)
+
+                if self.selected_mode is None:
+                    self.ctrl_held = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+                    self.shift_held = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+
+                self.points = [(event.x, event.y)]
         return True
 
+    def select_mode(self, mode_id):
+        """Handle mode button selection"""
+        self.mode_selector_active = False
+        self.selected_mode = mode_id
+
+        if mode_id == 'dots':
+            self.dot_mode = True
+            self.ctrl_held = False
+            self.shift_held = False
+        elif mode_id == 'freehand':
+            self.dot_mode = False
+            self.ctrl_held = False
+            self.shift_held = False
+        elif mode_id == 'rectangle':
+            self.dot_mode = False
+            self.ctrl_held = True
+            self.shift_held = False
+
+        self.drawing_area.queue_draw()
+
     def on_motion(self, widget, event):
-        if self.drawing:
+        # Mode selector hover detection
+        if self.mode_selector_active:
+            old_hover = self.hovered_button
+            self.hovered_button = None
+            if hasattr(self, 'button_rects'):
+                for btn in self.button_rects:
+                    if (btn['x'] <= event.x <= btn['x'] + btn['w'] and
+                        btn['y'] <= event.y <= btn['y'] + btn['h']):
+                        self.hovered_button = btn['id']
+                        break
+            if old_hover != self.hovered_button:
+                self.drawing_area.queue_draw()
+            return True
+
+        if self.edit_mode:
+            if self.dragging_point_idx is not None:
+                self.simplified_points[self.dragging_point_idx] = (event.x, event.y)
+                self.drawing_area.queue_draw()
+            elif self.swipe_start_y is not None:
+                delta_y = self.swipe_start_y - event.y
+                self.swipe_accumulated += delta_y
+                self.swipe_start_y = event.y
+
+                if abs(self.swipe_accumulated) >= self.swipe_threshold:
+                    if self.swipe_accumulated > 0:
+                        self.adjust_point_count(increase=True)
+                    else:
+                        self.adjust_point_count(increase=False)
+                    self.swipe_accumulated = 0
+                    self.drawing_area.queue_draw()
+            else:
+                old_hover = self.hover_point_idx
+                self.hover_point_idx = None
+                for i, (px, py) in enumerate(self.simplified_points):
+                    dist = ((event.x - px) ** 2 + (event.y - py) ** 2) ** 0.5
+                    if dist < 15:
+                        self.hover_point_idx = i
+                        break
+                if old_hover != self.hover_point_idx:
+                    self.drawing_area.queue_draw()
+        elif self.drawing:
             self.end_point = (event.x, event.y)
             if not self.ctrl_held:
                 self.points.append((event.x, event.y))
@@ -249,29 +574,201 @@ class LiveOverlay(Gtk.Window):
                 self.start_point = None
                 self.end_point = None
                 self.drawing_area.queue_draw()
+        elif event.button == 1 and self.edit_mode:
+            self.dragging_point_idx = None
+            self.swipe_start_y = None
+            self.swipe_accumulated = 0
         return True
+
+    def adjust_point_count(self, increase=True):
+        """Adjust the number of control points"""
+        if self.original_contour_points and len(self.original_contour_points) >= 4:
+            source_points = self.original_contour_points
+        elif self.simplified_points and len(self.simplified_points) >= 4:
+            source_points = self.simplified_points
+        else:
+            return
+
+        current_count = len(self.simplified_points)
+
+        if increase:
+            new_count = min(current_count + 5, 200)
+            if new_count <= current_count:
+                return
+        else:
+            new_count = max(current_count - 5, 8)
+            if new_count >= current_count:
+                return
+
+        # Resample points
+        total_length = 0
+        for i in range(len(source_points)):
+            j = (i + 1) % len(source_points)
+            dx = source_points[j][0] - source_points[i][0]
+            dy = source_points[j][1] - source_points[i][1]
+            total_length += (dx*dx + dy*dy) ** 0.5
+
+        if total_length == 0:
+            return
+
+        segment_length = total_length / new_count
+        new_points = [source_points[0]]
+        accumulated = 0
+        current_segment = 0
+
+        for i in range(len(source_points)):
+            j = (i + 1) % len(source_points)
+            dx = source_points[j][0] - source_points[i][0]
+            dy = source_points[j][1] - source_points[i][1]
+            seg_len = (dx*dx + dy*dy) ** 0.5
+
+            while accumulated + seg_len >= segment_length * (current_segment + 1) and current_segment < new_count - 1:
+                t = (segment_length * (current_segment + 1) - accumulated) / seg_len if seg_len > 0 else 0
+                x = source_points[i][0] + t * dx
+                y = source_points[i][1] + t * dy
+                new_points.append((x, y))
+                current_segment += 1
+
+            accumulated += seg_len
+
+        if len(new_points) >= 4:
+            self.simplified_points = new_points
+            self.point_history = []
+
+    def interpolate_points(self):
+        """Create smooth curve through simplified control points"""
+        if len(self.simplified_points) < 3:
+            return self.simplified_points
+
+        result = []
+        points = self.simplified_points
+        n = len(points)
+
+        for i in range(n):
+            p0 = points[(i - 1) % n]
+            p1 = points[i]
+            p2 = points[(i + 1) % n]
+            p3 = points[(i + 2) % n]
+
+            for t in [x / 10.0 for x in range(10)]:
+                t2 = t * t
+                t3 = t2 * t
+
+                x = 0.5 * ((2 * p1[0]) +
+                          (-p0[0] + p2[0]) * t +
+                          (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                          (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+
+                y = 0.5 * ((2 * p1[1]) +
+                          (-p0[1] + p2[1]) * t +
+                          (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                          (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+
+                result.append((x, y))
+
+        return result
 
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
-            self.callback(None)
-            self.destroy()
-            Gtk.main_quit()
+            if self.edit_mode:
+                self.edit_mode = False
+                self.simplified_points = []
+                self.points = []
+                self.dot_mode = True
+                self.dot_points = []
+                self.drawing_area.queue_draw()
+            elif self.dot_mode and self.dot_points:
+                self.dot_points = []
+                self.drawing_area.queue_draw()
+            else:
+                self.callback(None)
+                self.destroy()
+                Gtk.main_quit()
+        elif event.keyval == Gdk.KEY_Return:
+            if not self.edit_mode and not self.drawing and len(self.points) == 0 and not self.dot_points:
+                self.send_entire_image()
+                return True
+            elif self.dot_mode and self.dot_points and not self.edit_mode:
+                if len(self.dot_points) >= 3:
+                    self.points = self.dot_points.copy()
+                    self.simplified_points = self.dot_points.copy()
+                    self.original_contour_points = self.dot_points.copy()
+                    self.dot_mode = False
+                    self.edit_mode = True
+                    self.point_history = []
+                    self.drawing_area.queue_draw()
+            elif self.edit_mode:
+                self.points = self.interpolate_points()
+                self.edit_mode = False
+                self.process_selection()
+        elif event.keyval == Gdk.KEY_BackSpace:
+            if self.dot_mode and self.dot_points and not self.edit_mode:
+                self.dot_points.pop()
+                self.drawing_area.queue_draw()
+            elif self.edit_mode and self.point_history:
+                idx, old_pos = self.point_history.pop()
+                if idx < len(self.simplified_points):
+                    self.simplified_points[idx] = old_pos
+                    self.drawing_area.queue_draw()
+        elif event.keyval == Gdk.KEY_Up:
+            if self.edit_mode:
+                self.adjust_point_count(increase=True)
+                self.drawing_area.queue_draw()
+        elif event.keyval == Gdk.KEY_Down:
+            if self.edit_mode:
+                self.adjust_point_count(increase=False)
+                self.drawing_area.queue_draw()
         elif event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
             self.ctrl_held = True
             self.drawing_area.queue_draw()
         elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
             self.shift_held = True
             self.drawing_area.queue_draw()
+        elif event.keyval in (Gdk.KEY_m, Gdk.KEY_M):
+            if not self.edit_mode and not self.drawing and len(self.points) == 0:
+                self.mode_selector_active = not self.mode_selector_active
+                self.drawing_area.queue_draw()
         return True
 
     def on_key_release(self, widget, event):
-        if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
-            self.ctrl_held = False
-            self.drawing_area.queue_draw()
-        elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
-            self.shift_held = False
-            self.drawing_area.queue_draw()
+        if self.selected_mode is None:
+            if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+                self.ctrl_held = False
+                self.drawing_area.queue_draw()
+            elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+                self.shift_held = False
+                self.drawing_area.queue_draw()
         return True
+
+    def send_entire_image(self):
+        """Capture and send the entire screen"""
+        if self.selection_made:
+            return
+        self.selection_made = True
+
+        self._capture_mode = True
+        self.drawing_area.queue_draw()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        self.hide()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+
+        import time
+        time.sleep(0.1)
+
+        import uuid
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, f"circle_search_full_{uuid.uuid4().hex[:8]}.png")
+
+        if take_screenshot_with_tool(output_path):
+            self.callback(output_path)
+        else:
+            self.callback(None)
+
+        self.destroy()
+        Gtk.main_quit()
 
     def get_bounding_box(self):
         if self.ctrl_held and self.start_point and self.end_point:
@@ -322,6 +819,9 @@ class LiveOverlay(Gtk.Window):
             Gtk.main_quit()
             return
 
+        # Save points for polygon mask before clearing
+        self._capture_points = self.points.copy() if self.points else []
+
         # Clear the drawing and make overlay fully transparent before capture
         self.points = []
         self.start_point = None
@@ -357,14 +857,40 @@ class LiveOverlay(Gtk.Window):
         import uuid
         temp_dir = tempfile.gettempdir()
         cropped_path = os.path.join(temp_dir, f"circle_search_crop_{uuid.uuid4().hex[:8]}.png")
-        geometry = f"{int(x)},{int(y)} {int(width)}x{int(height)}"
 
-        result = subprocess.run(
-            ["grim", "-g", geometry, cropped_path],
-            capture_output=True
-        )
+        success = take_screenshot_with_tool(cropped_path, geometry=(x, y, width, height))
 
-        if result.returncode == 0:
+        if success:
+            # Apply polygon mask if we have points from dot/freehand mode
+            if len(self._capture_points) >= 3:
+                from PIL import ImageDraw, ImageFilter
+
+                img = Image.open(cropped_path)
+                img = img.convert('RGBA')
+
+                # Create mask from polygon points (offset to crop origin)
+                mask = Image.new('L', img.size, 0)
+                draw = ImageDraw.Draw(mask)
+
+                # Scale points to cropped image coordinates
+                # For live mode, screen coords == image coords (no HiDPI scaling needed for grim crop)
+                scaled_points = []
+                for px, py in self._capture_points:
+                    sx = int(px - x)
+                    sy = int(py - y)
+                    scaled_points.append((sx, sy))
+
+                if len(scaled_points) > 2:
+                    draw.polygon(scaled_points, fill=255)
+
+                # Smooth the mask edges
+                mask = mask.filter(ImageFilter.GaussianBlur(3))
+                mask = mask.point(lambda x: 255 if x > 80 else 0)
+
+                # Apply mask to alpha channel
+                img.putalpha(mask)
+                img.save(cropped_path, "PNG", optimize=True)
+
             self._callback(cropped_path)
         else:
             self._callback(None)
@@ -386,9 +912,49 @@ class CircleOverlay(Gtk.Window):
         self.selection_made = False
         self.ctrl_held = False
         self.shift_held = False
+        self.alt_held = False  # Alt for edge-snap mode
         self.start_point = None
         self.end_point = None
         self.pixbuf = GdkPixbuf.Pixbuf.new_from_file(screenshot_path)
+
+        # Zoom mode - magnifier that follows cursor
+        self.zoom_mode = False
+        self.zoom_level = 3  # 3x magnification
+        self.zoom_size = 120  # Size of magnifier window
+        self.mouse_x = 0
+        self.mouse_y = 0
+
+        # Edit mode - for adjusting points after tracing
+        self.edit_mode = False
+        self.dragging_point_idx = None
+        self.hover_point_idx = None
+        self.simplified_points = []  # Reduced points for editing
+
+        # Swipe detection for adjusting point count
+        self.swipe_start_y = None
+        self.swipe_accumulated = 0  # Accumulated swipe distance
+        self.swipe_threshold = 80  # Pixels needed before triggering adjustment
+        self.original_contour_points = None  # Store original high-detail contour for resampling
+
+        # Undo history for point movements
+        self.point_history = []  # Stack of (index, old_position) tuples
+
+        # Connect-the-dots mode (default mode - click to place points, Enter to finish)
+        self.dot_mode = False  # Will be set when mode is selected
+        self.dot_points = []  # Points placed in dot mode
+
+        # Mode selector - shown at startup (M key to open)
+        self.mode_selector_active = False  # Hidden by default, freehand is default
+        self.selected_mode = 'freehand'  # Default to freehand for quick circle-and-go
+        self.hovered_button = None  # Track which button is hovered
+
+        # Define mode buttons (will be positioned in on_draw)
+        self.mode_buttons = [
+            {'id': 'dots', 'label': 'Connect Dots', 'desc': 'Click to place points'},
+            {'id': 'freehand', 'label': 'Freehand', 'desc': 'Draw freely'},
+            {'id': 'rectangle', 'label': 'Rectangle', 'desc': 'Drag box shape'},
+        ]
+        self.button_rects = []  # Will be populated in on_draw
 
         # Get screen dimensions
         display = Gdk.Display.get_default()
@@ -398,6 +964,9 @@ class CircleOverlay(Gtk.Window):
 
         self.screen_width = geometry.width
         self.screen_height = geometry.height
+
+        # Precompute edge map for edge-snapping (Alt + draw)
+        self.edge_map = self._compute_edge_map()
 
         # Make window fullscreen and transparent
         self.set_decorated(False)
@@ -431,6 +1000,49 @@ class CircleOverlay(Gtk.Window):
             Gdk.EventMask.KEY_RELEASE_MASK
         )
         self.connect("key-release-event", self.on_key_release)
+
+    def _compute_edge_map(self):
+        """Compute edge map for edge-snapping"""
+        from PIL import ImageFilter
+
+        img = Image.open(self.screenshot_path)
+
+        # Scale to screen size for coordinate matching
+        img = img.resize((self.screen_width, self.screen_height), Image.LANCZOS)
+
+        # Convert to grayscale and detect edges
+        gray = img.convert('L')
+
+        # Apply Sobel-like edge detection
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+
+        # Enhance edges with slight blur for smoother snapping
+        edges = edges.filter(ImageFilter.GaussianBlur(1))
+
+        return np.array(edges)
+
+    def snap_to_edge(self, x, y, search_radius=12):
+        """Light edge snapping - only snap if very close to a strong edge"""
+        x = int(max(0, min(x, self.screen_width - 1)))
+        y = int(max(0, min(y, self.screen_height - 1)))
+
+        # Only snap if there's a strong edge very close (within 8 pixels)
+        best_x, best_y = x, y
+        best_dist = 999
+
+        for dy in range(-search_radius, search_radius + 1, 1):
+            for dx in range(-search_radius, search_radius + 1, 1):
+                nx, ny = x + dx, y + dy
+                if 0 <= nx < self.screen_width and 0 <= ny < self.screen_height:
+                    strength = self.edge_map[ny, nx]
+                    distance = (dx * dx + dy * dy) ** 0.5
+
+                    # Only snap to strong edges that are very close
+                    if strength > 40 and distance < best_dist and distance < 10:
+                        best_dist = distance
+                        best_x, best_y = nx, ny
+
+        return best_x, best_y
 
     def on_draw(self, widget, cr):
         import math
@@ -514,8 +1126,80 @@ class CircleOverlay(Gtk.Window):
                 cr.arc(px, py, 2, 0, 2 * math.pi)
                 cr.fill()
 
-        elif len(self.points) > 1:
-            # Draw freeform path with glow
+            # Draw crosshair at center to help with placement
+            cx = (x1 + x2) / 2
+            cy = (y1 + y2) / 2
+            crosshair_size = 15
+
+            # Crosshair glow
+            cr.set_line_width(3)
+            cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+            cr.move_to(cx - crosshair_size, cy)
+            cr.line_to(cx + crosshair_size, cy)
+            cr.stroke()
+            cr.move_to(cx, cy - crosshair_size)
+            cr.line_to(cx, cy + crosshair_size)
+            cr.stroke()
+
+            # Crosshair main line
+            cr.set_line_width(1.5)
+            cr.set_source_rgba(1, 1, 1, 0.9)
+            cr.move_to(cx - crosshair_size, cy)
+            cr.line_to(cx + crosshair_size, cy)
+            cr.stroke()
+            cr.move_to(cx, cy - crosshair_size)
+            cr.line_to(cx, cy + crosshair_size)
+            cr.stroke()
+
+            # Center dot
+            cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+            cr.arc(cx, cy, 3, 0, 2 * math.pi)
+            cr.fill()
+
+        # Connect-the-dots mode visualization
+        elif self.dot_mode and self.dot_points and not self.edit_mode:
+            # Draw lines connecting the dots
+            if len(self.dot_points) > 1:
+                def draw_dot_path():
+                    cr.move_to(self.dot_points[0][0], self.dot_points[0][1])
+                    for point in self.dot_points[1:]:
+                        cr.line_to(point[0], point[1])
+                    # Draw line back to first point to show closed shape
+                    if len(self.dot_points) >= 3:
+                        cr.line_to(self.dot_points[0][0], self.dot_points[0][1])
+
+                draw_glow_stroke(draw_dot_path, line_width=3)
+
+            # Draw each dot point with number - scale size based on point count
+            num_dots = len(self.dot_points)
+            # Scale from 12 (at 3 points) down to 6 (at 50+ points)
+            outer_radius = max(6, 12 - (num_dots - 3) * 6 / 47)
+            inner_radius = outer_radius * 0.58
+            center_radius = outer_radius * 0.25
+            font_size = max(8, 10 - (num_dots - 3) * 2 / 47)
+            label_offset = outer_radius + 3
+
+            for i, (px, py) in enumerate(self.dot_points):
+                # Outer glow
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+                cr.arc(px, py, outer_radius, 0, 2 * math.pi)
+                cr.fill()
+                # Main dot
+                cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                cr.arc(px, py, inner_radius, 0, 2 * math.pi)
+                cr.fill()
+                # White center
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.arc(px, py, center_radius, 0, 2 * math.pi)
+                cr.fill()
+                # Point number
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.set_font_size(font_size)
+                cr.move_to(px + label_offset, py - label_offset)
+                cr.show_text(str(i + 1))
+
+        elif len(self.points) > 1 and not self.edit_mode:
+            # Draw freeform path with glow (hidden in edit mode)
             def draw_path():
                 cr.move_to(self.points[0][0], self.points[0][1])
                 for point in self.points[1:]:
@@ -540,11 +1224,169 @@ class CircleOverlay(Gtk.Window):
                 cr.arc(point[0], point[1], 4, 0, 2 * math.pi)
                 cr.fill()
 
-        # Show help text with glow effect
-        if not self.drawing and len(self.points) == 0 and not self.start_point:
+        # Edit mode - show control points and interpolated curve
+        if self.edit_mode and self.simplified_points:
+            # Draw interpolated smooth curve (closed path)
+            smooth_points = self.interpolate_points()
+            if len(smooth_points) > 1:
+                cr.set_source_rgba(0.2, 0.9, 0.4, 0.8)
+                cr.set_line_width(3)
+                cr.move_to(smooth_points[0][0], smooth_points[0][1])
+                for point in smooth_points[1:]:
+                    cr.line_to(point[0], point[1])
+                cr.close_path()  # Connect back to start
+                cr.stroke()
+
+            # Draw control points as draggable handles
+            # Scale dot size based on point count: fewer points = larger dots
+            num_points = len(self.simplified_points)
+            # Scale from 5 (at 8 points) down to 2 (at 200 points)
+            base_size = max(2, 5 - (num_points - 8) * 3 / 192)
+            drag_size = base_size * 1.6  # Proportional scaling
+            hover_size = base_size * 1.4  # Proportional scaling
+            inner_size = base_size * 0.5
+
+            for i, (px, py) in enumerate(self.simplified_points):
+                # Highlight hovered or dragged point
+                if i == self.dragging_point_idx:
+                    cr.set_source_rgba(1, 0.8, 0.2, 1)  # Yellow for dragging
+                    cr.arc(px, py, drag_size, 0, 2 * math.pi)
+                    cr.fill()
+                elif i == self.hover_point_idx:
+                    cr.set_source_rgba(0.2, 0.9, 0.9, 0.8)  # Cyan for hover
+                    cr.arc(px, py, hover_size, 0, 2 * math.pi)
+                    cr.fill()
+
+                # Outer ring
+                cr.set_source_rgba(0.2, 0.9, 0.4, 0.9)
+                cr.arc(px, py, base_size, 0, 2 * math.pi)
+                cr.fill()
+                # Inner circle
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.arc(px, py, inner_size, 0, 2 * math.pi)
+                cr.fill()
+
+            # Show edit mode instructions
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(18)
+            text = f"Drag points  •  ↑↓ = ±points ({len(self.simplified_points)})  •  ENTER = confirm"
+            extents = cr.text_extents(text)
+            x = (self.screen_width - extents.width) / 2
+            y = 50
+
+            # Background for text
+            cr.set_source_rgba(0, 0, 0, 0.7)
+            cr.rectangle(x - 20, y - 25, extents.width + 40, 40)
+            cr.fill()
+
+            cr.set_source_rgba(0.4, 1, 0.6, 1)
+            cr.move_to(x, y)
+            cr.show_text(text)
+
+        # Show mode selector at startup
+        elif self.mode_selector_active:
             cr.select_font_face("Sans", 0, 1)  # Bold
 
-            text = "Draw a circle around the area to search"
+            # Title
+            text = "Select Mode"
+            cr.set_font_size(32)
+            extents = cr.text_extents(text)
+            x = (self.screen_width - extents.width) / 2
+            y = self.screen_height / 2 - 120
+
+            # Text glow
+            cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+            for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                cr.move_to(x + dx, y + dy)
+                cr.show_text(text)
+            cr.set_source_rgba(1, 1, 1, 0.95)
+            cr.move_to(x, y)
+            cr.show_text(text)
+
+            # Draw mode buttons
+            button_width = 140
+            button_height = 70
+            button_spacing = 20
+            total_width = len(self.mode_buttons) * button_width + (len(self.mode_buttons) - 1) * button_spacing
+            start_x = (self.screen_width - total_width) / 2
+            button_y = self.screen_height / 2 - 30
+
+            # Store button positions for click detection
+            self.button_rects = []
+
+            for i, btn in enumerate(self.mode_buttons):
+                bx = start_x + i * (button_width + button_spacing)
+                by = button_y
+
+                self.button_rects.append({
+                    'id': btn['id'],
+                    'x': bx, 'y': by,
+                    'w': button_width, 'h': button_height
+                })
+
+                # Button background
+                is_hovered = self.hovered_button == btn['id']
+                if is_hovered:
+                    # Hovered - brighter
+                    cr.set_source_rgba(0.55, 0.23, 0.93, 0.8)
+                else:
+                    cr.set_source_rgba(0.2, 0.1, 0.3, 0.7)
+
+                # Rounded rectangle
+                radius = 10
+                cr.new_path()
+                cr.arc(bx + radius, by + radius, radius, math.pi, 1.5 * math.pi)
+                cr.arc(bx + button_width - radius, by + radius, radius, 1.5 * math.pi, 2 * math.pi)
+                cr.arc(bx + button_width - radius, by + button_height - radius, radius, 0, 0.5 * math.pi)
+                cr.arc(bx + radius, by + button_height - radius, radius, 0.5 * math.pi, math.pi)
+                cr.close_path()
+                cr.fill()
+
+                # Button border
+                if is_hovered:
+                    cr.set_source_rgba(0.93, 0.47, 0.86, 1.0)
+                else:
+                    cr.set_source_rgba(0.55, 0.23, 0.93, 0.6)
+                cr.set_line_width(2)
+                cr.new_path()
+                cr.arc(bx + radius, by + radius, radius, math.pi, 1.5 * math.pi)
+                cr.arc(bx + button_width - radius, by + radius, radius, 1.5 * math.pi, 2 * math.pi)
+                cr.arc(bx + button_width - radius, by + button_height - radius, radius, 0, 0.5 * math.pi)
+                cr.arc(bx + radius, by + button_height - radius, radius, 0.5 * math.pi, math.pi)
+                cr.close_path()
+                cr.stroke()
+
+                # Button label
+                cr.set_font_size(14)
+                label_extents = cr.text_extents(btn['label'])
+                label_x = bx + (button_width - label_extents.width) / 2
+                label_y = by + 28
+                cr.set_source_rgba(1, 1, 1, 1.0 if is_hovered else 0.9)
+                cr.move_to(label_x, label_y)
+                cr.show_text(btn['label'])
+
+                # Button description
+                cr.set_font_size(11)
+                desc_extents = cr.text_extents(btn['desc'])
+                desc_x = bx + (button_width - desc_extents.width) / 2
+                desc_y = by + 50
+                cr.set_source_rgba(0.8, 0.8, 0.9, 0.8 if is_hovered else 0.6)
+                cr.move_to(desc_x, desc_y)
+                cr.show_text(btn['desc'])
+
+            # ESC hint
+            cr.set_font_size(14)
+            hint = "ESC = cancel"
+            hint_extents = cr.text_extents(hint)
+            cr.set_source_rgba(0.6, 0.6, 0.7, 0.7)
+            cr.move_to((self.screen_width - hint_extents.width) / 2, button_y + button_height + 40)
+            cr.show_text(hint)
+
+        # Show help text for dot mode
+        elif self.dot_mode and not self.dot_points and not self.edit_mode:
+            cr.select_font_face("Sans", 0, 1)  # Bold
+
+            text = "Click to place points, ENTER to finish"
             cr.set_font_size(28)
             extents = cr.text_extents(text)
             x = (self.screen_width - extents.width) / 2
@@ -562,38 +1404,289 @@ class CircleOverlay(Gtk.Window):
             cr.show_text(text)
 
             cr.set_font_size(16)
-            text2 = "CTRL = rectangle  •  CTRL+SHIFT = ellipse  •  ESC = cancel"
+            text2 = "LEFT click = add point  •  RIGHT click / BACKSPACE = undo  •  ESC = cancel"
             extents2 = cr.text_extents(text2)
             x2 = (self.screen_width - extents2.width) / 2
             cr.set_source_rgba(0.8, 0.8, 0.9, 0.8)
             cr.move_to(x2, y + 45)
             cr.show_text(text2)
 
+        # Show dot mode status when points exist
+        elif self.dot_mode and self.dot_points and not self.edit_mode:
+            cr.select_font_face("Sans", 0, 1)
+            cr.set_font_size(18)
+            text = f"{len(self.dot_points)} points  •  ENTER = finish  •  BACKSPACE = undo  •  ESC = clear"
+            extents = cr.text_extents(text)
+            x = (self.screen_width - extents.width) / 2
+            y = 50
+
+            # Background
+            cr.set_source_rgba(0, 0, 0, 0.7)
+            cr.rectangle(x - 20, y - 25, extents.width + 40, 40)
+            cr.fill()
+
+            cr.set_source_rgba(0.4, 1, 0.6, 1)
+            cr.move_to(x, y)
+            cr.show_text(text)
+
+        # Show help for other modes (freehand, ellipse, rectangle, ai)
+        elif self.selected_mode and not self.edit_mode and not self.drawing and len(self.points) == 0:
+            cr.select_font_face("Sans", 0, 1)
+
+            if self.selected_mode == 'freehand':
+                text = "Draw around the object"
+                text2 = "Hold mouse and draw  •  ENTER = full image  •  M = modes  •  ESC = cancel"
+            elif self.selected_mode == 'rectangle':
+                text = "Drag to draw a rectangle"
+                text2 = "Click and drag  •  ESC = cancel"
+            else:
+                text = ""
+                text2 = ""
+
+            if text:
+                cr.set_font_size(28)
+                extents = cr.text_extents(text)
+                x = (self.screen_width - extents.width) / 2
+                y = self.screen_height / 2 - 50
+
+                # Text glow
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.5)
+                for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
+                    cr.move_to(x + dx, y + dy)
+                    cr.show_text(text)
+
+                cr.set_source_rgba(1, 1, 1, 0.95)
+                cr.move_to(x, y)
+                cr.show_text(text)
+
+                cr.set_font_size(16)
+                extents2 = cr.text_extents(text2)
+                x2 = (self.screen_width - extents2.width) / 2
+                cr.set_source_rgba(0.8, 0.8, 0.9, 0.8)
+                cr.move_to(x2, y + 45)
+                cr.show_text(text2)
+
+        # Zoom mode - draw magnifier
+        if self.zoom_mode and self.pixbuf:
+            zoom_size = self.zoom_size
+            zoom_level = self.zoom_level
+            half_size = zoom_size // 2
+
+            # Position magnifier offset from cursor
+            mag_x = self.mouse_x + 30
+            mag_y = self.mouse_y - zoom_size - 10
+
+            # Keep magnifier on screen
+            if mag_x + zoom_size > self.screen_width:
+                mag_x = self.mouse_x - zoom_size - 30
+            if mag_y < 0:
+                mag_y = self.mouse_y + 30
+
+            # Calculate source region from image (accounting for HiDPI)
+            scale_x = self.pixbuf.get_width() / self.screen_width
+            scale_y = self.pixbuf.get_height() / self.screen_height
+
+            src_x = int((self.mouse_x - half_size / zoom_level) * scale_x)
+            src_y = int((self.mouse_y - half_size / zoom_level) * scale_y)
+            src_w = int((zoom_size / zoom_level) * scale_x)
+            src_h = int((zoom_size / zoom_level) * scale_y)
+
+            # Clamp to image bounds
+            src_x = max(0, min(src_x, self.pixbuf.get_width() - src_w))
+            src_y = max(0, min(src_y, self.pixbuf.get_height() - src_h))
+
+            if src_w > 0 and src_h > 0:
+                # Extract and scale the region
+                sub_pixbuf = self.pixbuf.new_subpixbuf(src_x, src_y, src_w, src_h)
+                scaled_pixbuf = sub_pixbuf.scale_simple(zoom_size, zoom_size, GdkPixbuf.InterpType.NEAREST)
+
+                # Draw magnifier background
+                cr.set_source_rgba(0.1, 0.1, 0.2, 0.95)
+                cr.arc(mag_x + half_size, mag_y + half_size, half_size + 4, 0, 2 * math.pi)
+                cr.fill()
+
+                # Clip to circle and draw zoomed image
+                cr.save()
+                cr.arc(mag_x + half_size, mag_y + half_size, half_size, 0, 2 * math.pi)
+                cr.clip()
+                Gdk.cairo_set_source_pixbuf(cr, scaled_pixbuf, mag_x, mag_y)
+                cr.paint()
+                cr.restore()
+
+                # Draw border
+                cr.set_line_width(3)
+                cr.set_source_rgba(0.55, 0.23, 0.93, 0.8)
+                cr.arc(mag_x + half_size, mag_y + half_size, half_size, 0, 2 * math.pi)
+                cr.stroke()
+
+                # Draw crosshair in center
+                cr.set_line_width(1)
+                cr.set_source_rgba(1, 1, 1, 0.8)
+                center_x = mag_x + half_size
+                center_y = mag_y + half_size
+                cr.move_to(center_x - 10, center_y)
+                cr.line_to(center_x + 10, center_y)
+                cr.move_to(center_x, center_y - 10)
+                cr.line_to(center_x, center_y + 10)
+                cr.stroke()
+
+                # Show zoom level
+                cr.set_font_size(10)
+                cr.set_source_rgba(1, 1, 1, 0.9)
+                cr.move_to(mag_x + 5, mag_y + zoom_size - 5)
+                cr.show_text(f"{zoom_level}x  •  Z = toggle")
+
         return False
 
     def on_button_press(self, widget, event):
+        # Mode selector: check if clicking on a button
+        if self.mode_selector_active and event.button == 1:
+            if hasattr(self, 'button_rects'):
+                for btn in self.button_rects:
+                    if (btn['x'] <= event.x <= btn['x'] + btn['w'] and
+                        btn['y'] <= event.y <= btn['y'] + btn['h']):
+                        self.select_mode(btn['id'])
+                        return True
+            return True  # Consume click even if not on button
+
+        # Connect-the-dots mode: click to place points
+        if self.dot_mode and not self.edit_mode:
+            if event.button == 1:  # Left click - add point
+                self.dot_points.append((event.x, event.y))
+                print(f"DEBUG: Dot mode - added point {len(self.dot_points)} at ({event.x:.0f}, {event.y:.0f})")
+                self.drawing_area.queue_draw()
+                return True
+            elif event.button == 3:  # Right click - remove last point
+                if self.dot_points:
+                    removed = self.dot_points.pop()
+                    print(f"DEBUG: Dot mode - removed point at ({removed[0]:.0f}, {removed[1]:.0f})")
+                    self.drawing_area.queue_draw()
+                return True
+
         if event.button == 1:
-            self.drawing = True
-            self.start_point = (event.x, event.y)
-            self.end_point = (event.x, event.y)
-            self.points = [(event.x, event.y)]
-            self.ctrl_held = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
-            self.shift_held = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+            if self.edit_mode:
+                # Check if clicking on a control point
+                for i, (px, py) in enumerate(self.simplified_points):
+                    dist = ((event.x - px) ** 2 + (event.y - py) ** 2) ** 0.5
+                    if dist < 20:  # Click radius
+                        self.dragging_point_idx = i
+                        # Save current position for undo before dragging
+                        self.point_history.append((i, (px, py)))
+                        self.drawing_area.queue_draw()
+                        return True
+                # Not on a control point - start swipe detection
+                self.swipe_start_y = event.y
+                self.swipe_accumulated = 0
+            else:
+                self.drawing = True
+                self.start_point = (event.x, event.y)
+                self.end_point = (event.x, event.y)
+
+                # Only check keyboard state if no mode was pre-selected from buttons
+                if self.selected_mode is None:
+                    self.ctrl_held = bool(event.state & Gdk.ModifierType.CONTROL_MASK)
+                    self.shift_held = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
+                    self.alt_held = bool(event.state & Gdk.ModifierType.MOD1_MASK)
+                # else: keep the ctrl_held, shift_held, alt_held from select_mode()
+
+                # If Alt is held (freehand with edge snap), snap start point to edge
+                if self.alt_held and not self.ctrl_held:
+                    snapped = self.snap_to_edge(event.x, event.y)
+                    self.points = [snapped]
+                else:
+                    self.points = [(event.x, event.y)]
         return True
 
+    def select_mode(self, mode_id):
+        """Handle mode button selection"""
+        print(f"DEBUG: Selected mode: {mode_id}")
+        self.mode_selector_active = False
+        self.selected_mode = mode_id
+
+        if mode_id == 'dots':
+            self.dot_mode = True
+            self.ctrl_held = False
+            self.shift_held = False
+            self.alt_held = False
+        elif mode_id == 'freehand':
+            self.dot_mode = False
+            self.ctrl_held = False
+            self.shift_held = False
+            self.alt_held = False
+        elif mode_id == 'rectangle':
+            self.dot_mode = False
+            self.ctrl_held = True
+            self.shift_held = False
+            self.alt_held = False
+
+        self.drawing_area.queue_draw()
+
     def on_motion(self, widget, event):
-        if self.drawing:
+        # Mode selector hover detection
+        if self.mode_selector_active:
+            old_hover = self.hovered_button
+            self.hovered_button = None
+            if hasattr(self, 'button_rects'):
+                for btn in self.button_rects:
+                    if (btn['x'] <= event.x <= btn['x'] + btn['w'] and
+                        btn['y'] <= event.y <= btn['y'] + btn['h']):
+                        self.hovered_button = btn['id']
+                        break
+            if old_hover != self.hovered_button:
+                self.drawing_area.queue_draw()
+            return True
+
+        if self.edit_mode:
+            # Handle point dragging
+            if self.dragging_point_idx is not None:
+                self.simplified_points[self.dragging_point_idx] = (event.x, event.y)
+                self.drawing_area.queue_draw()
+            elif self.swipe_start_y is not None:
+                # Handle swipe for adjusting point count
+                delta_y = self.swipe_start_y - event.y  # Positive = swipe up
+                self.swipe_accumulated += delta_y
+                self.swipe_start_y = event.y
+
+                # Check if we've accumulated enough for an adjustment
+                if abs(self.swipe_accumulated) >= self.swipe_threshold:
+                    if self.swipe_accumulated > 0:
+                        # Swipe up - more points
+                        self.adjust_point_count(increase=True)
+                    else:
+                        # Swipe down - fewer points
+                        self.adjust_point_count(increase=False)
+                    self.swipe_accumulated = 0
+                    self.drawing_area.queue_draw()
+            else:
+                # Update hover state
+                old_hover = self.hover_point_idx
+                self.hover_point_idx = None
+                for i, (px, py) in enumerate(self.simplified_points):
+                    dist = ((event.x - px) ** 2 + (event.y - py) ** 2) ** 0.5
+                    if dist < 15:
+                        self.hover_point_idx = i
+                        break
+                if old_hover != self.hover_point_idx:
+                    self.drawing_area.queue_draw()
+        elif self.drawing:
             self.end_point = (event.x, event.y)
             if not self.ctrl_held:
                 self.points.append((event.x, event.y))
             self.drawing_area.queue_draw()
+
+        # Track mouse position for zoom mode
+        self.mouse_x = event.x
+        self.mouse_y = event.y
+        if self.zoom_mode:
+            self.drawing_area.queue_draw()
+
         return True
 
     def on_button_release(self, widget, event):
         if event.button == 1 and self.drawing:
             self.drawing = False
             if self.ctrl_held and self.start_point and self.end_point:
-                # Shape mode - generate points from bounding box
+                # Shape mode - process the selection directly
                 self.process_selection()
             elif len(self.points) > 10:
                 self.process_selection()
@@ -602,28 +1695,216 @@ class CircleOverlay(Gtk.Window):
                 self.start_point = None
                 self.end_point = None
                 self.drawing_area.queue_draw()
+        elif event.button == 1 and self.edit_mode:
+            # Release dragged point and reset swipe
+            self.dragging_point_idx = None
+            self.swipe_start_y = None
+            self.swipe_accumulated = 0
         return True
+
+    def interpolate_points(self):
+        """Create smooth curve through simplified control points (closed loop)"""
+        if len(self.simplified_points) < 3:
+            return self.simplified_points
+
+        # Catmull-Rom spline interpolation for smooth closed curves
+        result = []
+        points = self.simplified_points
+        n = len(points)
+
+        for i in range(n):
+            # Use modulo for closed loop - wraps around
+            p0 = points[(i - 1) % n]
+            p1 = points[i]
+            p2 = points[(i + 1) % n]
+            p3 = points[(i + 2) % n]
+
+            # Generate points along the spline segment
+            for t in [x / 10.0 for x in range(10)]:
+                t2 = t * t
+                t3 = t2 * t
+
+                x = 0.5 * ((2 * p1[0]) +
+                          (-p0[0] + p2[0]) * t +
+                          (2 * p0[0] - 5 * p1[0] + 4 * p2[0] - p3[0]) * t2 +
+                          (-p0[0] + 3 * p1[0] - 3 * p2[0] + p3[0]) * t3)
+
+                y = 0.5 * ((2 * p1[1]) +
+                          (-p0[1] + p2[1]) * t +
+                          (2 * p0[1] - 5 * p1[1] + 4 * p2[1] - p3[1]) * t2 +
+                          (-p0[1] + 3 * p1[1] - 3 * p2[1] + p3[1]) * t3)
+
+                result.append((x, y))
+
+        return result
+
+    def adjust_point_count(self, increase=True):
+        """Adjust the number of control points by resampling from original contour"""
+        # Use original contour if available, otherwise current points
+        if self.original_contour_points and len(self.original_contour_points) >= 4:
+            source_points = self.original_contour_points
+        elif self.simplified_points and len(self.simplified_points) >= 4:
+            source_points = self.simplified_points
+        else:
+            return
+
+        current_count = len(self.simplified_points)
+
+        if increase:
+            # More points - allow up to 200 (interpolation can create more than source)
+            new_count = min(current_count + 5, 200)
+            if new_count <= current_count:
+                print(f"DEBUG: Already at max points ({current_count})")
+                return
+        else:
+            # Fewer points - simplify
+            new_count = max(current_count - 5, 8)  # Min 8 points
+            if new_count >= current_count:
+                print(f"DEBUG: Already at min points ({current_count})")
+                return
+
+        print(f"DEBUG: Adjusting points from {current_count} to {new_count} (source has {len(source_points)})")
+
+        # Resample from the ORIGINAL contour to preserve shape
+        # Close the path by adding first point at end for proper closed-loop calculation
+        points = list(source_points)
+        if len(points) > 0 and points[0] != points[-1]:
+            points.append(points[0])  # Close the loop
+
+        # Calculate total path length (now includes closing segment)
+        total_length = 0
+        lengths = [0]
+        for i in range(1, len(points)):
+            dx = points[i][0] - points[i-1][0]
+            dy = points[i][1] - points[i-1][1]
+            total_length += (dx*dx + dy*dy) ** 0.5
+            lengths.append(total_length)
+
+        if total_length == 0:
+            return
+
+        # Resample at uniform intervals around the closed path
+        new_points = []
+        for i in range(new_count):
+            target_length = (i / new_count) * total_length
+
+            # Find the segment containing this length
+            for j in range(1, len(lengths)):
+                if lengths[j] >= target_length:
+                    # Interpolate within this segment
+                    segment_start = lengths[j-1]
+                    segment_end = lengths[j]
+                    segment_length = segment_end - segment_start
+
+                    if segment_length > 0:
+                        t = (target_length - segment_start) / segment_length
+                    else:
+                        t = 0
+
+                    x = points[j-1][0] + t * (points[j][0] - points[j-1][0])
+                    y = points[j-1][1] + t * (points[j][1] - points[j-1][1])
+                    new_points.append((x, y))
+                    break
+
+        if len(new_points) >= 4:
+            self.simplified_points = new_points
+            self.point_history = []  # Clear undo history after resampling
+            print(f"DEBUG: Now have {len(self.simplified_points)} points")
 
     def on_key_press(self, widget, event):
         if event.keyval == Gdk.KEY_Escape:
-            self.callback(None)
-            self.destroy()
-            Gtk.main_quit()
+            if self.edit_mode:
+                # Cancel edit mode, go back to dot mode
+                self.edit_mode = False
+                self.simplified_points = []
+                self.points = []
+                self.dot_mode = True
+                self.dot_points = []
+                self.drawing_area.queue_draw()
+            elif self.dot_mode and self.dot_points:
+                # Clear dot points
+                self.dot_points = []
+                self.drawing_area.queue_draw()
+            else:
+                self.callback(None)
+                self.destroy()
+                Gtk.main_quit()
+        elif event.keyval == Gdk.KEY_Return:
+            # Enter with no selection = send entire image
+            if not self.edit_mode and not self.drawing and len(self.points) == 0 and not self.dot_points:
+                print("DEBUG: Enter pressed with no selection - sending entire image")
+                self.send_entire_image()
+                return True
+            elif self.dot_mode and self.dot_points and not self.edit_mode:
+                # Finish dot mode - use the placed points as selection
+                if len(self.dot_points) >= 3:
+                    print(f"DEBUG: Dot mode finished with {len(self.dot_points)} points")
+                    self.points = self.dot_points.copy()
+                    self.simplified_points = self.dot_points.copy()
+                    self.original_contour_points = self.dot_points.copy()
+                    self.dot_mode = False
+                    self.edit_mode = True  # Enter edit mode to refine
+                    self.point_history = []  # Clear undo history
+                    self.drawing_area.queue_draw()
+                else:
+                    print("DEBUG: Need at least 3 points to create a selection")
+            elif self.edit_mode:
+                # Confirm and process with interpolated smooth curve
+                self.points = self.interpolate_points()
+                self.edit_mode = False
+                self.process_selection()
+        elif event.keyval == Gdk.KEY_BackSpace:
+            if self.dot_mode and self.dot_points and not self.edit_mode:
+                # Remove last dot point
+                removed = self.dot_points.pop()
+                print(f"DEBUG: Dot mode - removed point at ({removed[0]:.0f}, {removed[1]:.0f})")
+                self.drawing_area.queue_draw()
+            elif self.edit_mode and self.point_history:
+                # Undo last point movement
+                idx, old_pos = self.point_history.pop()
+                if idx < len(self.simplified_points):
+                    self.simplified_points[idx] = old_pos
+                    print(f"DEBUG: Undo point {idx} to {old_pos}")
+                    self.drawing_area.queue_draw()
+        elif event.keyval == Gdk.KEY_Up:
+            if self.edit_mode:
+                # Arrow up - more points
+                self.adjust_point_count(increase=True)
+                self.drawing_area.queue_draw()
+        elif event.keyval == Gdk.KEY_Down:
+            if self.edit_mode:
+                # Arrow down - fewer points
+                self.adjust_point_count(increase=False)
+                self.drawing_area.queue_draw()
         elif event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
             self.ctrl_held = True
             self.drawing_area.queue_draw()
         elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
             self.shift_held = True
             self.drawing_area.queue_draw()
+        elif event.keyval in (Gdk.KEY_m, Gdk.KEY_M):
+            # M key - toggle mode selector
+            if not self.edit_mode and not self.drawing and len(self.points) == 0:
+                self.mode_selector_active = not self.mode_selector_active
+                print(f"DEBUG: Mode selector {'opened' if self.mode_selector_active else 'closed'}")
+                self.drawing_area.queue_draw()
+        elif event.keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            # Z key - toggle zoom mode
+            self.zoom_mode = not self.zoom_mode
+            print(f"DEBUG: Zoom mode {'enabled' if self.zoom_mode else 'disabled'}")
+            self.drawing_area.queue_draw()
         return True
 
     def on_key_release(self, widget, event):
-        if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
-            self.ctrl_held = False
-            self.drawing_area.queue_draw()
-        elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
-            self.shift_held = False
-            self.drawing_area.queue_draw()
+        # Only respond to key releases if no mode was pre-selected
+        # Otherwise the mode buttons lock in the ctrl/shift/alt state
+        if self.selected_mode is None:
+            if event.keyval in (Gdk.KEY_Control_L, Gdk.KEY_Control_R):
+                self.ctrl_held = False
+                self.drawing_area.queue_draw()
+            elif event.keyval in (Gdk.KEY_Shift_L, Gdk.KEY_Shift_R):
+                self.shift_held = False
+                self.drawing_area.queue_draw()
         return True
 
     def get_bounding_box(self):
@@ -653,6 +1934,30 @@ class CircleOverlay(Gtk.Window):
         y2 = min(self.screen_height, max(ys) + padding)
 
         return (int(x1), int(y1), int(x2), int(y2))
+
+    def send_entire_image(self):
+        """Send the entire screenshot without any selection"""
+        if self.selection_made:
+            return
+        self.selection_made = True
+
+        img = Image.open(self.screenshot_path)
+
+        # Resize if too large
+        max_size = 2000
+        if img.width > max_size or img.height > max_size:
+            ratio = min(max_size / img.width, max_size / img.height)
+            new_size = (int(img.width * ratio), int(img.height * ratio))
+            img = img.resize(new_size, Image.LANCZOS)
+
+        # Save to temp file
+        temp_dir = tempfile.gettempdir()
+        output_path = os.path.join(temp_dir, "circle_search_crop.png")
+        img.save(output_path, "PNG", optimize=True)
+
+        self.callback(output_path)
+        self.destroy()
+        Gtk.main_quit()
 
     def process_selection(self):
         if self.selection_made:
@@ -692,6 +1997,36 @@ class CircleOverlay(Gtk.Window):
 
         cropped = img.crop((x1_scaled, y1_scaled, x2_scaled, y2_scaled))
 
+        # Apply polygon mask with transparency if we have enough points
+        # This works for dot mode, freehand mode, or AI-traced mode
+        if len(self.points) >= 3:
+            from PIL import ImageDraw, ImageFilter
+
+            # Convert to RGBA for transparency
+            cropped = cropped.convert('RGBA')
+
+            # Create mask from polygon points (scaled to crop coordinates)
+            mask = Image.new('L', cropped.size, 0)
+            draw = ImageDraw.Draw(mask)
+
+            # Scale points to cropped image coordinates
+            scaled_points = []
+            for px, py in self.points:
+                # Scale from screen to image, then offset to crop origin
+                sx = int(px * scale_x) - x1_scaled
+                sy = int(py * scale_y) - y1_scaled
+                scaled_points.append((sx, sy))
+
+            if len(scaled_points) > 2:
+                draw.polygon(scaled_points, fill=255)
+
+            # Smooth the mask edges - blur then threshold for clean edges
+            mask = mask.filter(ImageFilter.GaussianBlur(3))
+            mask = mask.point(lambda x: 255 if x > 80 else 0)
+
+            # Apply mask to alpha channel
+            cropped.putalpha(mask)
+
         # Resize if too large to avoid memory issues
         max_crop_size = 2000
         if cropped.width > max_crop_size or cropped.height > max_crop_size:
@@ -709,15 +2044,21 @@ class CircleOverlay(Gtk.Window):
         self.destroy()
         Gtk.main_quit()
 
-
 class ImagePreviewDialog(Gtk.Window):
     """Dark themed dialog showing image preview with options"""
-    def __init__(self, image_path):
+    def __init__(self, image_path, has_transparency=False):
         super().__init__(title="Circle to Search")
         self.image_path = image_path
         self.result = None
+        self.has_transparency = has_transparency  # Whether image has alpha channel
+        self.output_format = 'png'  # Default format
+        self.feather_amount = 0  # 0 = no feather, up to 20
 
-        self.set_default_size(520, 500)
+        # Store original image for live preview updates
+        self.original_image = Image.open(image_path)
+        self.preview_image = None  # Will hold the Gtk.Image widget
+
+        self.set_default_size(520, 580)
         self.set_position(Gtk.WindowPosition.CENTER)
         self.set_keep_above(True)
         self.set_resizable(True)
@@ -769,29 +2110,65 @@ class ImagePreviewDialog(Gtk.Window):
         frame.get_style_context().add_class("image-frame")
 
         # Load and display the cropped image
-        pixbuf = GdkPixbuf.Pixbuf.new_from_file(image_path)
-        max_size = 420
-        width = pixbuf.get_width()
-        height = pixbuf.get_height()
-        if width > max_size or height > max_size:
-            scale = min(max_size / width, max_size / height)
-            pixbuf = pixbuf.scale_simple(int(width * scale), int(height * scale), GdkPixbuf.InterpType.BILINEAR)
+        self.max_preview_size = 420
+        pixbuf = self.get_preview_pixbuf()
 
-        image = Gtk.Image.new_from_pixbuf(pixbuf)
-        image.set_margin_top(12)
-        image.set_margin_bottom(12)
-        image.set_margin_start(12)
-        image.set_margin_end(12)
+        self.preview_image = Gtk.Image.new_from_pixbuf(pixbuf)
+        self.preview_image.set_margin_top(12)
+        self.preview_image.set_margin_bottom(12)
+        self.preview_image.set_margin_start(12)
+        self.preview_image.set_margin_end(12)
 
         # Center image using Box instead of deprecated Alignment
         image_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         image_box.set_halign(Gtk.Align.CENTER)
         image_box.set_valign(Gtk.Align.CENTER)
-        image_box.pack_start(image, False, False, 0)
+        image_box.pack_start(self.preview_image, False, False, 0)
         image_box.set_size_request(450, 280)
 
         frame.add(image_box)
         vbox.pack_start(frame, True, True, 0)
+
+        # Options row (format + feather)
+        options_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        options_box.set_margin_top(8)
+        vbox.pack_start(options_box, False, False, 0)
+
+        # Format selector
+        format_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        format_label = Gtk.Label(label="Format:")
+        format_label.get_style_context().add_class("option-label")
+        format_box.pack_start(format_label, False, False, 0)
+
+        self.format_combo = Gtk.ComboBoxText()
+        self.format_combo.append('png', 'PNG (transparent)')
+        self.format_combo.append('jpg', 'JPG (smaller)')
+        self.format_combo.append('webp', 'WebP (best)')
+        self.format_combo.set_active_id('png')
+        self.format_combo.connect('changed', self.on_format_changed)
+        self.format_combo.get_style_context().add_class("format-combo")
+        format_box.pack_start(self.format_combo, False, False, 0)
+        options_box.pack_start(format_box, False, False, 0)
+
+        # Feather slider
+        feather_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        feather_label = Gtk.Label(label="Edge Feather:")
+        feather_label.get_style_context().add_class("option-label")
+        feather_box.pack_start(feather_label, False, False, 0)
+
+        self.feather_scale = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 20, 1)
+        self.feather_scale.set_value(0)
+        self.feather_scale.set_size_request(120, -1)
+        self.feather_scale.set_draw_value(False)
+        self.feather_scale.connect('value-changed', self.on_feather_changed)
+        self.feather_scale.get_style_context().add_class("feather-scale")
+        feather_box.pack_start(self.feather_scale, True, True, 0)
+
+        self.feather_value_label = Gtk.Label(label="0px")
+        self.feather_value_label.get_style_context().add_class("option-label")
+        self.feather_value_label.set_size_request(35, -1)
+        feather_box.pack_start(self.feather_value_label, False, False, 0)
+        options_box.pack_end(feather_box, True, True, 0)
 
         # Buttons container
         buttons_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -835,6 +2212,68 @@ class ImagePreviewDialog(Gtk.Window):
             self.begin_move_drag(event.button, int(event.x_root), int(event.y_root), event.time)
         return True
 
+    def on_format_changed(self, combo):
+        self.output_format = combo.get_active_id()
+        # If JPG selected and image has transparency, show warning
+        if self.output_format == 'jpg' and self.has_transparency:
+            self.format_combo.set_tooltip_text("JPG doesn't support transparency - edges will have white background")
+        else:
+            self.format_combo.set_tooltip_text("")
+
+    def on_feather_changed(self, scale):
+        self.feather_amount = int(scale.get_value())
+        self.feather_value_label.set_text(f"{self.feather_amount}px")
+        # Update preview
+        self.update_preview()
+
+    def get_preview_pixbuf(self):
+        """Generate preview pixbuf with current feather settings"""
+        img = self.original_image.copy()
+
+        # Apply feather effect if image has transparency
+        if self.feather_amount > 0 and img.mode == 'RGBA':
+            from PIL import ImageFilter
+            alpha = img.getchannel('A')
+            alpha = alpha.filter(ImageFilter.GaussianBlur(self.feather_amount))
+            img.putalpha(alpha)
+
+        # Convert PIL Image to GdkPixbuf
+        if img.mode == 'RGBA':
+            data = img.tobytes()
+            pixbuf = GdkPixbuf.Pixbuf.new_from_data(
+                data, GdkPixbuf.Colorspace.RGB, True, 8,
+                img.width, img.height, img.width * 4
+            )
+        else:
+            img_rgb = img.convert('RGB')
+            data = img_rgb.tobytes()
+            pixbuf = GdkPixbuf.Pixbuf.new_from_data(
+                data, GdkPixbuf.Colorspace.RGB, False, 8,
+                img_rgb.width, img_rgb.height, img_rgb.width * 3
+            )
+
+        # Scale to preview size
+        width = pixbuf.get_width()
+        height = pixbuf.get_height()
+        if width > self.max_preview_size or height > self.max_preview_size:
+            scale = min(self.max_preview_size / width, self.max_preview_size / height)
+            pixbuf = pixbuf.scale_simple(int(width * scale), int(height * scale), GdkPixbuf.InterpType.BILINEAR)
+
+        return pixbuf
+
+    def update_preview(self):
+        """Update the preview image with current settings"""
+        if self.preview_image:
+            pixbuf = self.get_preview_pixbuf()
+            self.preview_image.set_from_pixbuf(pixbuf)
+
+    def get_output_settings(self):
+        """Return current format and feather settings"""
+        return {
+            'format': self.output_format,
+            'feather': self.feather_amount
+        }
+
     def apply_dark_theme(self):
         css = b"""
         window {
@@ -850,6 +2289,36 @@ class ImagePreviewDialog(Gtk.Window):
             font-size: 14px;
             font-weight: 600;
             font-family: "Inter", "SF Pro Display", "Segoe UI", sans-serif;
+        }
+        label.option-label {
+            color: #94a3b8;
+            font-size: 12px;
+        }
+        .format-combo, combobox {
+            background: #1e1e3f;
+            color: #e2e8f0;
+            border: 1px solid rgba(139, 92, 246, 0.3);
+            border-radius: 6px;
+            padding: 4px 8px;
+            font-size: 12px;
+        }
+        .feather-scale, scale {
+            padding: 0;
+        }
+        scale trough {
+            background: #1e1e3f;
+            border-radius: 4px;
+            min-height: 6px;
+        }
+        scale highlight {
+            background: linear-gradient(90deg, #7c3aed 0%, #a855f7 100%);
+            border-radius: 4px;
+        }
+        scale slider {
+            background: #a855f7;
+            border-radius: 50%;
+            min-width: 14px;
+            min-height: 14px;
         }
         .close-button {
             background: transparent;
@@ -1183,13 +2652,100 @@ class TextResultDialog(Gtk.Window):
         Gtk.main_quit()
 
 
+def detect_screenshot_tool():
+    """Detect available screenshot tool, preferring compositor-native ones."""
+    # Try grim first (wlroots: Hyprland, Sway, etc.)
+    result = subprocess.run(["grim", "-"], capture_output=True)
+    if result.returncode == 0 or b"compositor" not in result.stderr:
+        # grim works or failed for a reason other than protocol support
+        if result.returncode == 0:
+            return "grim"
+
+    # Try spectacle (KDE Plasma)
+    if subprocess.run(["which", "spectacle"], capture_output=True).returncode == 0:
+        return "spectacle"
+
+    # Try gnome-screenshot (GNOME)
+    if subprocess.run(["which", "gnome-screenshot"], capture_output=True).returncode == 0:
+        return "gnome-screenshot"
+
+    # Fallback to grim anyway (let it fail with proper error)
+    return "grim"
+
+
+def take_screenshot_with_tool(output_path, tool=None, geometry=None):
+    """
+    Take a screenshot using the specified or auto-detected tool.
+
+    Args:
+        output_path: Path to save the screenshot
+        tool: Screenshot tool to use (auto-detect if None)
+        geometry: Optional tuple (x, y, width, height) for region capture
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if tool is None:
+        tool = detect_screenshot_tool()
+
+    if tool == "grim":
+        if geometry:
+            x, y, w, h = geometry
+            geom_str = f"{int(x)},{int(y)} {int(w)}x{int(h)}"
+            result = subprocess.run(["grim", "-g", geom_str, output_path], capture_output=True)
+        else:
+            result = subprocess.run(["grim", output_path], capture_output=True)
+        return result.returncode == 0
+
+    elif tool == "spectacle":
+        # spectacle: -b = background, -n = no notification, -o = output file
+        result = subprocess.run(
+            ["spectacle", "-b", "-n", "-o", output_path],
+            capture_output=True
+        )
+        if result.returncode != 0:
+            return False
+
+        # If geometry requested, crop the full screenshot
+        if geometry:
+            try:
+                x, y, w, h = geometry
+                img = Image.open(output_path)
+                cropped = img.crop((int(x), int(y), int(x + w), int(y + h)))
+                cropped.save(output_path)
+            except Exception:
+                return False
+        return True
+
+    elif tool == "gnome-screenshot":
+        # gnome-screenshot: -f = output file
+        result = subprocess.run(
+            ["gnome-screenshot", "-f", output_path],
+            capture_output=True
+        )
+        if result.returncode != 0:
+            return False
+
+        # If geometry requested, crop the full screenshot
+        if geometry:
+            try:
+                x, y, w, h = geometry
+                img = Image.open(output_path)
+                cropped = img.crop((int(x), int(y), int(x + w), int(y + h)))
+                cropped.save(output_path)
+            except Exception:
+                return False
+        return True
+
+    return False
+
+
 def take_screenshot():
     temp_dir = tempfile.gettempdir()
     screenshot_path = os.path.join(temp_dir, "circle_search_screenshot.png")
-    result = subprocess.run(["grim", screenshot_path], capture_output=True)
-    if result.returncode != 0:
-        return None
-    return screenshot_path
+    if take_screenshot_with_tool(screenshot_path):
+        return screenshot_path
+    return None
 
 
 def copy_to_clipboard_image(path):
@@ -1211,10 +2767,6 @@ def main():
 Modes:
   --static   Screenshot-based overlay (default, works everywhere)
   --live     Layer-shell overlay with live screen (Hyprland/Sway only)
-
-Example keybindings for Hyprland:
-  bind = $mainMod, S, exec, circle-to-search.py --static
-  bind = $mainMod SHIFT, S, exec, circle-to-search.py --live
         """
     )
     parser.add_argument('--live', action='store_true',
@@ -1265,7 +2817,7 @@ Example keybindings for Hyprland:
         # Static mode - take screenshot first
         screenshot_path = take_screenshot()
         if not screenshot_path:
-            subprocess.run(["notify-send", "Error", "Failed to take screenshot"])
+            subprocess.run(["notify-send", "Error", "Failed to take screenshot. Install grim (wlroots), spectacle (KDE), or gnome-screenshot (GNOME)."])
             sys.exit(1)
 
         overlay = CircleOverlay(screenshot_path, on_selection)
@@ -1282,20 +2834,60 @@ Example keybindings for Hyprland:
     if not crop_path[0]:
         sys.exit(0)
 
+    # Check if image has transparency
+    img = Image.open(crop_path[0])
+    has_transparency = img.mode == 'RGBA' and img.getchannel('A').getextrema()[0] < 255
+
     # Copy image to clipboard
     copy_to_clipboard_image(crop_path[0])
 
-    # Save to persistent location
+    # Save to persistent location (will be updated with format choice)
     persistent_path = "/tmp/circle_search_upload.png"
     subprocess.run(["cp", crop_path[0], persistent_path], capture_output=True)
 
     # Phase 2: Show preview dialog
-    dialog = ImagePreviewDialog(crop_path[0])
+    dialog = ImagePreviewDialog(crop_path[0], has_transparency=has_transparency)
     dialog.show_all()
     Gtk.main()
 
     choice = dialog.result
+    output_settings = dialog.get_output_settings()
     dialog.destroy()
+
+    # Apply output settings (format and feather) if needed
+    if output_settings['feather'] > 0 or output_settings['format'] != 'png':
+        img = Image.open(crop_path[0])
+
+        # Apply feather effect to edges
+        if output_settings['feather'] > 0 and img.mode == 'RGBA':
+            from PIL import ImageFilter
+            # Get alpha channel and apply gaussian blur for feathering
+            alpha = img.getchannel('A')
+            feather_amount = output_settings['feather']
+            alpha = alpha.filter(ImageFilter.GaussianBlur(feather_amount))
+            img.putalpha(alpha)
+
+        # Convert format
+        fmt = output_settings['format']
+        if fmt == 'jpg':
+            # JPG doesn't support transparency - composite on white
+            if img.mode == 'RGBA':
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                background.paste(img, mask=img.split()[3])
+                img = background
+            else:
+                img = img.convert('RGB')
+            persistent_path = "/tmp/circle_search_upload.jpg"
+            img.save(persistent_path, "JPEG", quality=90)
+        elif fmt == 'webp':
+            persistent_path = "/tmp/circle_search_upload.webp"
+            img.save(persistent_path, "WEBP", quality=90)
+        else:  # png
+            persistent_path = "/tmp/circle_search_upload.png"
+            img.save(persistent_path, "PNG", optimize=True)
+
+        # Update clipboard with new version
+        copy_to_clipboard_image(persistent_path)
 
     if choice == "tineye":
         # Upload in background script to avoid freezing

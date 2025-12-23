@@ -1,4 +1,4 @@
-# Circle to Search v1.1.0
+# Circle to Search v1.2.0
 
 ## Features
 
@@ -7,6 +7,7 @@
 - **Ellipse Mode** - Hold `Ctrl+Shift` while drawing
 - **Google Lens Integration** - Upload and search automatically
 - **OCR Text Extraction** - Extract text using Tesseract
+- **Multi-Desktop Support** - KDE Plasma, GNOME, Hyprland, Sway
 - **Clipboard Support** - Selections automatically copied
 - **HiDPI Support** - Works on high-DPI displays
 - **Modern UI** - Dark theme with purple/pink neon glow effects
@@ -56,7 +57,8 @@ Super + Ctrl + Shift + S
 
 **All modes:**
 - Wayland compositor
-- `grim`, `wl-clipboard`
+- Screenshot tool: `grim` (wlroots), `spectacle` (KDE), or `gnome-screenshot` (GNOME)
+- `wl-clipboard`
 
 **Live mode (additional):**
 - Hyprland or Sway
