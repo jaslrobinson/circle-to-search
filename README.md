@@ -108,6 +108,12 @@ chmod +x circle-to-search.py
 |-----|--------|
 | `Ctrl` + drag | Draw rectangle |
 | `Ctrl+Shift` + drag | Draw ellipse |
+| `Alt` + drag | Freehand with edge-snap |
+| `Z` | Toggle zoom/magnifier |
+| `M` | Open mode selector |
+| `Up` / `Down` | Adjust control points (edit mode) |
+| `Backspace` | Undo last point |
+| `Enter` | Confirm selection / send entire image |
 | `Escape` | Cancel |
 
 ### Recommended: Bind to Keyboard Shortcuts
