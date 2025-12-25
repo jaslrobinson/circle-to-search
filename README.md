@@ -196,7 +196,7 @@ The app automatically detects and uses the appropriate screenshot tool:
 |------|---------------------|
 | `grim` | Hyprland, Sway (wlroots) |
 | `spectacle` | KDE Plasma |
-| GNOME Shell D-Bus API | GNOME 42+ (built-in, no extra packages) |
+| `gnome shell D-Bus API`| gnome 42+ (built-in, no extra packages) 
 
 ## License
 
