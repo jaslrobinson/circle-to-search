@@ -174,7 +174,7 @@ This creates `Circle_to_Search-x86_64.AppImage` with all dependencies bundled.
 ## How It Works
 
 ### Static Mode
-1. Takes a fullscreen screenshot (auto-detects: `grim`, `spectacle`, or `gnome-screenshot`)
+1. Takes a fullscreen screenshot (auto-detects: `grim`, `spectacle`, or GNOME Shell D-Bus)
 2. Displays the screenshot as an overlay background
 3. You draw your selection on the frozen image
 4. Crops the selected region
@@ -196,7 +196,7 @@ The app automatically detects and uses the appropriate screenshot tool:
 |------|---------------------|
 | `grim` | Hyprland, Sway (wlroots) |
 | `spectacle` | KDE Plasma |
-| `gnome-screenshot` | GNOME |
+| GNOME Shell D-Bus API | GNOME 42+ (built-in, no extra packages) |
 
 ## License
 

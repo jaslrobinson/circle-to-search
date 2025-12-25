@@ -57,7 +57,7 @@ Super + Ctrl + Shift + S
 
 **All modes:**
 - Wayland compositor
-- Screenshot tool: `grim` (wlroots), `spectacle` (KDE), or `gnome-screenshot` (GNOME)
+- Screenshot tool: `grim` (wlroots), `spectacle` (KDE), or GNOME Shell D-Bus (GNOME 42+, built-in)
 - `wl-clipboard`
 
 **Live mode (additional):**

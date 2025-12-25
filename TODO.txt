@@ -1,3 +1,8 @@
+v1.2.2 Release:
+- Replaced deprecated gnome-screenshot with GNOME Shell D-Bus Screenshot API
+- GNOME 42+ now uses native screenshot API (no extra packages needed)
+- gnome-screenshot was deprecated/broken on GNOME 49+
+
 v1.2.0 Release:
 - Added KDE Plasma support (spectacle)
 - Added GNOME support (gnome-screenshot)

@@ -10,7 +10,7 @@ Modes:
 Screenshot support:
   - grim: For wlroots-based compositors (Hyprland, Sway, etc.)
   - spectacle: For KDE Plasma
-  - gnome-screenshot: For GNOME
+  - GNOME Shell D-Bus API: For GNOME 42+ (native, no extra packages needed)
 """
 
 import subprocess
@@ -2655,19 +2655,32 @@ class TextResultDialog(Gtk.Window):
 def detect_screenshot_tool():
     """Detect available screenshot tool, preferring compositor-native ones."""
     # Try grim first (wlroots: Hyprland, Sway, etc.)
-    result = subprocess.run(["grim", "-"], capture_output=True)
-    if result.returncode == 0 or b"compositor" not in result.stderr:
-        # grim works or failed for a reason other than protocol support
-        if result.returncode == 0:
-            return "grim"
+    try:
+        result = subprocess.run(["grim", "-"], capture_output=True)
+        if result.returncode == 0 or b"compositor" not in result.stderr:
+            # grim works or failed for a reason other than protocol support
+            if result.returncode == 0:
+                return "grim"
+    except FileNotFoundError:
+        pass  # grim not installed, try other tools
 
     # Try spectacle (KDE Plasma)
     if subprocess.run(["which", "spectacle"], capture_output=True).returncode == 0:
         return "spectacle"
 
-    # Try gnome-screenshot (GNOME)
-    if subprocess.run(["which", "gnome-screenshot"], capture_output=True).returncode == 0:
-        return "gnome-screenshot"
+    # Try GNOME Shell D-Bus Screenshot API (GNOME 42+)
+    # gnome-screenshot is deprecated and broken on GNOME 49+
+    try:
+        result = subprocess.run(
+            ["gdbus", "introspect", "--session",
+             "--dest", "org.gnome.Shell.Screenshot",
+             "--object-path", "/org/gnome/Shell/Screenshot"],
+            capture_output=True, timeout=2
+        )
+        if result.returncode == 0:
+            return "gnome-shell"
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
 
     # Fallback to grim anyway (let it fail with proper error)
     return "grim"
@@ -2717,10 +2730,15 @@ def take_screenshot_with_tool(output_path, tool=None, geometry=None):
                 return False
         return True
 
-    elif tool == "gnome-screenshot":
-        # gnome-screenshot: -f = output file
+    elif tool == "gnome-shell":
+        # Use GNOME Shell D-Bus Screenshot API (works on GNOME 42+)
+        # gnome-screenshot is deprecated and broken on GNOME 49+
         result = subprocess.run(
-            ["gnome-screenshot", "-f", output_path],
+            ["gdbus", "call", "--session",
+             "--dest", "org.gnome.Shell.Screenshot",
+             "--object-path", "/org/gnome/Shell/Screenshot",
+             "--method", "org.gnome.Shell.Screenshot.Screenshot",
+             "false", "false", output_path],
             capture_output=True
         )
         if result.returncode != 0:
@@ -2817,7 +2835,7 @@ Modes:
         # Static mode - take screenshot first
         screenshot_path = take_screenshot()
         if not screenshot_path:
-            subprocess.run(["notify-send", "Error", "Failed to take screenshot. Install grim (wlroots), spectacle (KDE), or gnome-screenshot (GNOME)."])
+            subprocess.run(["notify-send", "Error", "Failed to take screenshot. Install grim (wlroots) or spectacle (KDE). GNOME uses built-in D-Bus API."])
             sys.exit(1)
 
         overlay = CircleOverlay(screenshot_path, on_selection)
