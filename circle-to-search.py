@@ -21,7 +21,11 @@ import argparse
 import urllib.parse
 import threading
 import json
+import hashlib
+import time
 from pathlib import Path
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 import gi
 gi.require_version('Gtk', '3.0')
@@ -48,6 +52,284 @@ except ImportError:
 
 # Numpy for edge detection
 import numpy as np
+
+
+class TranslationCache:
+    """Thread-safe cache for translated text"""
+
+    def __init__(self, max_size=500):
+        self.cache = {}
+        self.max_size = max_size
+        self.lock = threading.Lock()
+        self.access_order = []
+
+    def _hash_text(self, text):
+        """Create hash key from normalized text"""
+        normalized = ' '.join(text.split()).lower()
+        return hashlib.md5(normalized.encode()).hexdigest()
+
+    def get(self, text):
+        """Get cached translation, returns None if not found"""
+        key = self._hash_text(text)
+        with self.lock:
+            if key in self.cache:
+                # Move to end (most recently used)
+                if key in self.access_order:
+                    self.access_order.remove(key)
+                self.access_order.append(key)
+                return self.cache[key]
+        return None
+
+    def set(self, text, translation):
+        """Store translation in cache"""
+        key = self._hash_text(text)
+        with self.lock:
+            # Evict oldest if at capacity
+            while len(self.cache) >= self.max_size and self.access_order:
+                oldest = self.access_order.pop(0)
+                self.cache.pop(oldest, None)
+
+            self.cache[key] = translation
+            if key in self.access_order:
+                self.access_order.remove(key)
+            self.access_order.append(key)
+
+
+class OllamaTranslator:
+    """Ollama LLM interface for translation"""
+
+    OLLAMA_URL = "http://localhost:11434/api/generate"
+    MODEL = "qwen2.5:7b"
+    TIMEOUT = 120  # Long timeout, but streaming means we don't wait if fast
+
+    def __init__(self):
+        self.available = self._check_availability()
+
+    def _check_availability(self):
+        """Check if Ollama is running"""
+        try:
+            req = Request("http://localhost:11434/api/tags")
+            with urlopen(req, timeout=2) as resp:
+                return resp.status == 200
+        except:
+            return False
+
+    def translate(self, text, target_lang="English"):
+        """Translate text using Ollama, returns None on failure"""
+        if not text.strip():
+            return text
+
+        prompt = f"""Translate to {target_lang}. Output only the translation.
+
+Example:
+Input: Привет, как дела?
+Output: Hello, how are you?
+
+Input: {text}
+Output:"""
+
+        try:
+            data = json.dumps({
+                "model": self.MODEL,
+                "prompt": prompt,
+                "stream": True  # Stream for faster response
+            }).encode()
+
+            req = Request(self.OLLAMA_URL, data=data)
+            req.add_header("Content-Type", "application/json")
+
+            response_text = []
+            with urlopen(req, timeout=self.TIMEOUT) as resp:
+                # Read streaming response line by line
+                for line in resp:
+                    try:
+                        chunk = json.loads(line.decode())
+                        if chunk.get("response"):
+                            response_text.append(chunk["response"])
+                        if chunk.get("done"):
+                            break
+                    except json.JSONDecodeError:
+                        continue
+
+            response = ''.join(response_text).strip()
+            # Clean up response - remove quotes if present
+            if response.startswith('"') and response.endswith('"'):
+                response = response[1:-1]
+            return response if response else None
+        except Exception:
+            return None
+
+
+def needs_translation(text):
+    """
+    Check if text needs translation (contains non-English characters).
+    Returns True if text should be translated.
+    """
+    if not text:
+        return False
+
+    text = text.strip()
+
+    # Skip short text (usernames, timestamps, etc.)
+    if len(text) < 4:
+        return False
+
+    # Skip if mostly numbers/punctuation
+    letters = sum(1 for c in text if c.isalpha())
+    if letters < 3:
+        return False
+
+    # Count non-ASCII characters
+    non_ascii_count = 0
+    for c in text:
+        if not c.isascii():
+            code = ord(c)
+            # CJK characters
+            if 0x4E00 <= code <= 0x9FFF:
+                non_ascii_count += 1
+            # Japanese Hiragana/Katakana
+            elif 0x3040 <= code <= 0x30FF:
+                non_ascii_count += 1
+            # Korean Hangul
+            elif 0xAC00 <= code <= 0xD7AF:
+                non_ascii_count += 1
+            # Cyrillic
+            elif 0x0400 <= code <= 0x04FF:
+                non_ascii_count += 1
+            # Arabic
+            elif 0x0600 <= code <= 0x06FF:
+                non_ascii_count += 1
+            # Hebrew
+            elif 0x0590 <= code <= 0x05FF:
+                non_ascii_count += 1
+            # Thai
+            elif 0x0E00 <= code <= 0x0E7F:
+                non_ascii_count += 1
+            # Devanagari (Hindi)
+            elif 0x0900 <= code <= 0x097F:
+                non_ascii_count += 1
+
+    # Need at least 2 non-ASCII characters to translate
+    return non_ascii_count >= 2
+
+
+def ocr_with_bounds(image_path):
+    """
+    Perform OCR and return text with bounding boxes.
+    Uses Tesseract's native hierarchy (block/paragraph/line) for accurate grouping.
+    """
+    if not OCR_AVAILABLE:
+        return []
+
+    try:
+        img = Image.open(image_path)
+
+        # Configuration for document-like content (articles, paragraphs)
+        # PSM 3 = Fully automatic page segmentation (best for articles)
+        # PSM 4 = Single column of variable sizes (alternative)
+        # OEM 1 = LSTM neural network only (best accuracy)
+        config = '--oem 1 --psm 3'
+
+        # Multi-language support
+        lang = 'eng+rus+chi_sim+chi_tra+kor+jpn'
+
+        try:
+            data = pytesseract.image_to_data(
+                img, lang=lang, config=config,
+                output_type=pytesseract.Output.DICT
+            )
+        except:
+            # Fallback if some language packs not installed
+            data = pytesseract.image_to_data(
+                img, config=config,
+                output_type=pytesseract.Output.DICT
+            )
+
+        # Use Tesseract's native hierarchy for grouping
+        # Group by (block_num, par_num) to get paragraph-level blocks
+        paragraphs = {}
+
+        n_boxes = len(data['text'])
+        for i in range(n_boxes):
+            text = data['text'][i].strip()
+            conf = int(data['conf'][i]) if str(data['conf'][i]) != '-1' else 0
+
+            # Skip empty text or very low confidence
+            if not text or conf < 30:
+                continue
+
+            # Create paragraph key from Tesseract's hierarchy
+            block_num = data['block_num'][i]
+            par_num = data['par_num'][i]
+            key = (block_num, par_num)
+
+            word = {
+                'text': text,
+                'left': data['left'][i],
+                'top': data['top'][i],
+                'width': data['width'][i],
+                'height': data['height'][i],
+                'conf': conf,
+                'line_num': data['line_num'][i]
+            }
+
+            if key not in paragraphs:
+                paragraphs[key] = []
+            paragraphs[key].append(word)
+
+        # Merge words into paragraph blocks
+        results = []
+        for key, words in paragraphs.items():
+            if not words:
+                continue
+
+            # Sort words by line, then by left position
+            words.sort(key=lambda w: (w['line_num'], w['left']))
+
+            # Group words by line for proper text ordering
+            lines = {}
+            for word in words:
+                line_key = word['line_num']
+                if line_key not in lines:
+                    lines[line_key] = []
+                lines[line_key].append(word)
+
+            # Build text from lines
+            text_parts = []
+            for line_num in sorted(lines.keys()):
+                line_words = sorted(lines[line_num], key=lambda w: w['left'])
+                line_text = ' '.join(w['text'] for w in line_words)
+                text_parts.append(line_text)
+
+            full_text = ' '.join(text_parts)
+
+            # Skip very short text (likely noise)
+            if len(full_text.strip()) < 3:
+                continue
+
+            # Calculate bounding box
+            left = min(w['left'] for w in words)
+            top = min(w['top'] for w in words)
+            right = max(w['left'] + w['width'] for w in words)
+            bottom = max(w['top'] + w['height'] for w in words)
+            avg_conf = sum(w['conf'] for w in words) / len(words)
+
+            results.append({
+                'text': full_text,
+                'left': left,
+                'top': top,
+                'width': right - left,
+                'height': bottom - top,
+                'conf': avg_conf
+            })
+
+        # Sort by vertical position (top to bottom)
+        results.sort(key=lambda r: (r['top'], r['left']))
+
+        return results
+
+    except Exception as e:
+        return []
 
 
 class LiveOverlay(Gtk.Window):
@@ -97,6 +379,21 @@ class LiveOverlay(Gtk.Window):
         ]
         self.button_rects = []
 
+        # Live translate mode - Select & Translate
+        self.live_translate_mode = False
+        self.translation_cache = TranslationCache()
+        self.translator = None  # Lazy init to avoid startup delay
+
+        # Translation regions: list of {box: (x,y,w,h), text: str, translation: str, pending: bool, font_size: int}
+        self.translation_regions = []
+        self.translate_lock = threading.Lock()
+
+        # Drawing state for translation boxes
+        self.translate_drawing = False
+        self.translate_start = None
+        self.translate_current = None
+        self.translate_hover_idx = None  # Index of region being hovered
+
         # Get screen dimensions
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0)
@@ -136,15 +433,42 @@ class LiveOverlay(Gtk.Window):
         self.connect("button-release-event", self.on_button_release)
         self.connect("motion-notify-event", self.on_motion)
         self.connect("key-press-event", self.on_key_press)
+        self.connect("scroll-event", self.on_scroll)
 
         self.add_events(
             Gdk.EventMask.BUTTON_PRESS_MASK |
             Gdk.EventMask.BUTTON_RELEASE_MASK |
             Gdk.EventMask.POINTER_MOTION_MASK |
             Gdk.EventMask.KEY_PRESS_MASK |
-            Gdk.EventMask.KEY_RELEASE_MASK
+            Gdk.EventMask.KEY_RELEASE_MASK |
+            Gdk.EventMask.SCROLL_MASK
         )
         self.connect("key-release-event", self.on_key_release)
+
+    def on_scroll(self, widget, event):
+        """Handle scroll wheel for font size adjustment in translate mode"""
+        if not self.live_translate_mode:
+            return False
+
+        if self.translate_hover_idx is not None:
+            with self.translate_lock:
+                if self.translate_hover_idx < len(self.translation_regions):
+                    region = self.translation_regions[self.translate_hover_idx]
+                    if event.direction == Gdk.ScrollDirection.UP:
+                        region['font_size'] = min(region['font_size'] + 2, 36)
+                    elif event.direction == Gdk.ScrollDirection.DOWN:
+                        region['font_size'] = max(region['font_size'] - 2, 8)
+                    elif event.direction == Gdk.ScrollDirection.SMOOTH:
+                        # Handle smooth scrolling (touchpad)
+                        delta_y = event.delta_y
+                        if delta_y < 0:
+                            region['font_size'] = min(region['font_size'] + 1, 36)
+                        elif delta_y > 0:
+                            region['font_size'] = max(region['font_size'] - 1, 8)
+            self.drawing_area.queue_draw()
+            return True
+
+        return False
 
     def on_draw(self, widget, cr):
         import math
@@ -153,6 +477,17 @@ class LiveOverlay(Gtk.Window):
         if getattr(self, '_capture_mode', False):
             cr.set_source_rgba(0, 0, 0, 0)
             cr.paint()
+            return False
+
+        # If in translate capture mode, draw minimal overlay (just status bar)
+        if getattr(self, '_translate_capture_mode', False):
+            cr.set_source_rgba(0, 0, 0, 0)
+            cr.paint()
+            return False
+
+        # Live translate mode - draw translations and return
+        if self.live_translate_mode:
+            self._draw_translations(cr)
             return False
 
         # Transparent background - live desktop shows through!
@@ -446,7 +781,412 @@ class LiveOverlay(Gtk.Window):
 
         return False
 
+    # ============== Select & Translate Methods ==============
+
+    def start_live_translate(self):
+        """Start the select & translate mode"""
+        if not OCR_AVAILABLE:
+            subprocess.run(["notify-send", "OCR Not Available",
+                           "Install pytesseract for translation"])
+            return False
+
+        # Lazy init translator
+        if self.translator is None:
+            self.translator = OllamaTranslator()
+
+        if not self.translator.available:
+            subprocess.run(["notify-send", "Ollama Not Available",
+                           "Start Ollama with: ollama serve"])
+            return False
+
+        self.live_translate_mode = True
+        self.translate_drawing = False
+        self.translate_start = None
+        self.translate_current = None
+        self.drawing_area.queue_draw()
+        return True
+
+    def stop_live_translate(self):
+        """Stop select & translate mode"""
+        self.live_translate_mode = False
+        self.translate_drawing = False
+        self.translate_start = None
+        self.translate_current = None
+        # Keep translation_regions so user can see results
+        self.drawing_area.queue_draw()
+
+    def clear_translations(self):
+        """Clear all translation regions"""
+        with self.translate_lock:
+            self.translation_regions = []
+        self.drawing_area.queue_draw()
+
+    def undo_last_translation(self):
+        """Remove the last translation region"""
+        with self.translate_lock:
+            if self.translation_regions:
+                self.translation_regions.pop()
+        self.drawing_area.queue_draw()
+
+    def _translate_mouse_press(self, x, y):
+        """Handle mouse press in translate mode"""
+        self.translate_drawing = True
+        self.translate_start = (x, y)
+        self.translate_current = (x, y)
+        self.drawing_area.queue_draw()
+
+    def _translate_mouse_motion(self, x, y):
+        """Handle mouse motion in translate mode"""
+        if self.translate_drawing:
+            self.translate_current = (x, y)
+            self.drawing_area.queue_draw()
+        else:
+            # Check if hovering over a region for font size adjustment
+            old_hover = self.translate_hover_idx
+            self.translate_hover_idx = None
+            with self.translate_lock:
+                for i, region in enumerate(self.translation_regions):
+                    bx, by, bw, bh = region['box']
+                    if bx <= x <= bx + bw and by <= y <= by + bh:
+                        self.translate_hover_idx = i
+                        break
+            if old_hover != self.translate_hover_idx:
+                self.drawing_area.queue_draw()
+
+    def _translate_mouse_release(self, x, y):
+        """Handle mouse release in translate mode - trigger OCR"""
+        if not self.translate_drawing or not self.translate_start:
+            return
+
+        self.translate_drawing = False
+        sx, sy = self.translate_start
+        ex, ey = x, y
+
+        # Calculate box coordinates
+        box_x = min(sx, ex)
+        box_y = min(sy, ey)
+        box_w = abs(ex - sx)
+        box_h = abs(ey - sy)
+
+        # Ignore tiny boxes
+        if box_w < 20 or box_h < 10:
+            self.translate_start = None
+            self.translate_current = None
+            self.drawing_area.queue_draw()
+            return
+
+        # Clear selection visuals first
+        self.translate_start = None
+        self.translate_current = None
+
+        # Take screenshot BEFORE adding any overlay text
+        # Hide overlay completely for clean capture
+        self._capture_mode = True
+        self.drawing_area.queue_draw()
+        while Gtk.events_pending():
+            Gtk.main_iteration_do(False)
+        time.sleep(0.05)  # Give compositor time to update
+
+        temp_path = f"/tmp/translate_region_{os.getpid()}_{int(time.time()*1000)}.png"
+        capture_ok = take_screenshot_with_tool(temp_path)
+
+        # Restore overlay
+        self._capture_mode = False
+        self.drawing_area.queue_draw()
+
+        if not capture_ok:
+            return
+
+        # NOW add placeholder region
+        region_idx = len(self.translation_regions)
+        with self.translate_lock:
+            self.translation_regions.append({
+                'box': (box_x, box_y, box_w, box_h),
+                'text': '',
+                'translation': 'Translating...',
+                'pending': True,
+                'font_size': 14  # Default font size
+            })
+        self.drawing_area.queue_draw()
+
+        # Process in background with pre-captured screenshot
+        threading.Thread(
+            target=self._process_region_translation,
+            args=(region_idx, box_x, box_y, box_w, box_h, temp_path),
+            daemon=True
+        ).start()
+
+    def _process_region_translation(self, region_idx, box_x, box_y, box_w, box_h, temp_path):
+        """OCR and translate a specific region"""
+        try:
+            # Crop to the selected region
+            try:
+                full_img = Image.open(temp_path)
+                img_w, img_h = full_img.size
+
+                # Get window/screen dimensions to determine actual scale
+                screen = Gdk.Screen.get_default()
+                screen_w = screen.get_width()
+                screen_h = screen.get_height()
+
+                # Calculate actual scale based on image vs screen size
+                # (screenshot may be at logical or physical resolution)
+                actual_scale = img_w / screen_w if screen_w > 0 else 1
+
+                # Get window position on screen (may be offset by panels)
+                win_x, win_y = self.get_position()
+
+                crop_box = (
+                    int((box_x + win_x) * actual_scale),
+                    int((box_y + win_y) * actual_scale),
+                    int((box_x + win_x + box_w) * actual_scale),
+                    int((box_y + win_y + box_h) * actual_scale)
+                )
+                cropped = full_img.crop(crop_box)
+                cropped.save(temp_path)
+            except Exception as e:
+                self._update_region(region_idx, '', f'Crop failed: {e}', False)
+                return
+
+            # Run OCR on cropped region
+            try:
+                lang = 'eng+rus+chi_sim+chi_tra+kor+jpn'
+                config = '--oem 1 --psm 6'  # PSM 6 = single uniform block
+                text = pytesseract.image_to_string(
+                    Image.open(temp_path),
+                    lang=lang,
+                    config=config
+                ).strip()
+                # Clean up OCR output - normalize whitespace
+                text = ' '.join(text.split())
+            except:
+                text = pytesseract.image_to_string(Image.open(temp_path)).strip()
+
+            if not text:
+                self._update_region(region_idx, '', 'No text detected', False)
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                return
+
+            # Check cache first
+            cached = self.translation_cache.get(text)
+            if cached:
+                self._update_region(region_idx, text, cached, False)
+                try:
+                    os.remove(temp_path)
+                except:
+                    pass
+                return
+
+            # Translate
+            self._update_region(region_idx, text, 'Translating...', True)
+            translation = self.translator.translate(text)
+            if translation:
+                self.translation_cache.set(text, translation)
+                self._update_region(region_idx, text, translation, False)
+            else:
+                self._update_region(region_idx, text, 'Translation failed', False)
+
+            # Cleanup
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+        except Exception as e:
+            self._update_region(region_idx, '', f'Error: {e}', False)
+
+    def _update_region(self, idx, text, translation, pending):
+        """Update a translation region and redraw"""
+        with self.translate_lock:
+            if idx < len(self.translation_regions):
+                self.translation_regions[idx]['text'] = text
+                self.translation_regions[idx]['translation'] = translation
+                self.translation_regions[idx]['pending'] = pending
+        GLib.idle_add(self.drawing_area.queue_draw)
+
+    def _draw_translations(self, cr):
+        """Draw translation regions and current selection"""
+        import math
+
+        # Light overlay
+        cr.set_source_rgba(0, 0, 0, 0.15)
+        cr.paint()
+
+        # Draw existing translation regions
+        with self.translate_lock:
+            regions = list(enumerate(self.translation_regions))
+
+        padding = 5  # Minimal padding to use full space
+
+        for idx, region in regions:
+            box_x, box_y, box_w, box_h = region['box']
+            translation = region['translation']
+            pending = region['pending']
+            font_size = region.get('font_size', 14)
+            line_height = font_size + 4  # Tighter line spacing
+            is_hovered = (idx == self.translate_hover_idx)
+
+            # Draw selection box - highlight if hovered
+            if is_hovered:
+                cr.set_source_rgba(0.3, 0.6, 1.0, 0.4)
+            else:
+                cr.set_source_rgba(0.4, 0.2, 0.9, 0.3)
+            cr.rectangle(box_x, box_y, box_w, box_h)
+            cr.fill()
+
+            if is_hovered:
+                cr.set_source_rgba(0.4, 0.8, 1.0, 0.9)
+                cr.set_line_width(3)
+            else:
+                cr.set_source_rgba(0.5, 0.3, 1.0, 0.8)
+                cr.set_line_width(2)
+            cr.rectangle(box_x, box_y, box_w, box_h)
+            cr.stroke()
+
+            # Word-wrap translation based on actual pixel width
+            cr.select_font_face("Sans", 0, 0)
+            cr.set_font_size(font_size)
+
+            max_width = box_w - padding * 2  # Available width in pixels
+
+            words = translation.split()
+            lines = []
+            current_line = []
+
+            for word in words:
+                test_line = ' '.join(current_line + [word])
+                text_width = cr.text_extents(test_line).width
+                if text_width > max_width and current_line:
+                    lines.append(' '.join(current_line))
+                    current_line = [word]
+                else:
+                    current_line.append(word)
+
+            if current_line:
+                lines.append(' '.join(current_line))
+
+            # Limit lines based on box height
+            max_lines = max(1, int((box_h - padding) / line_height))
+            if len(lines) > max_lines:
+                lines = lines[:max_lines]
+                # Truncate last line if needed
+                if lines[-1]:
+                    while cr.text_extents(lines[-1] + "...").width > max_width and len(lines[-1]) > 10:
+                        lines[-1] = lines[-1][:-1]
+                    lines[-1] = lines[-1].rstrip() + "..."
+
+            # Text box fills the selected region
+            text_box_w = box_w
+            text_box_h = box_h
+            text_x = box_x
+            text_y = box_y
+
+            # Calculate vertical centering for text within the box
+            total_text_height = len(lines) * line_height
+            text_start_y = text_y + (text_box_h - total_text_height) / 2
+
+            # Draw text background (fills the selection)
+            self._draw_rounded_rect(cr, text_x, text_y, text_box_w, text_box_h, 6)
+            if pending:
+                cr.set_source_rgba(0.2, 0.1, 0.3, 0.92)
+            else:
+                cr.set_source_rgba(0.05, 0.02, 0.1, 0.95)
+            cr.fill_preserve()
+
+            # Border
+            if pending:
+                cr.set_source_rgba(0.9, 0.7, 0.2, 0.9)
+            else:
+                cr.set_source_rgba(0.4, 0.8, 0.4, 0.9)
+            cr.set_line_width(1.5)
+            cr.stroke()
+
+            # Draw text (vertically centered)
+            if pending:
+                cr.set_source_rgba(1.0, 0.9, 0.5, 1.0)
+            else:
+                cr.set_source_rgba(0.9, 1.0, 0.9, 1.0)
+
+            for i, line in enumerate(lines):
+                ly = text_start_y + (i + 1) * line_height - 3
+                cr.move_to(text_x + padding, ly)
+                cr.show_text(line)
+
+            # Show font size indicator when hovered
+            if is_hovered:
+                size_text = f"Font: {font_size}px (scroll to adjust)"
+                cr.set_font_size(10)
+                cr.set_source_rgba(0.7, 0.9, 1.0, 0.9)
+                cr.move_to(box_x + 5, box_y + box_h - 5)
+                cr.show_text(size_text)
+
+        # Draw current selection being drawn
+        if self.translate_drawing and self.translate_start and self.translate_current:
+            sx, sy = self.translate_start
+            cx, cy = self.translate_current
+
+            x = min(sx, cx)
+            y = min(sy, cy)
+            w = abs(cx - sx)
+            h = abs(cy - sy)
+
+            # Dashed selection rectangle
+            cr.set_source_rgba(0.2, 0.8, 1.0, 0.4)
+            cr.rectangle(x, y, w, h)
+            cr.fill()
+            cr.set_source_rgba(0.3, 0.9, 1.0, 0.9)
+            cr.set_line_width(2)
+            cr.set_dash([8, 4])
+            cr.rectangle(x, y, w, h)
+            cr.stroke()
+            cr.set_dash([])
+
+        # Draw status bar
+        self._draw_translate_status(cr)
+
+    def _draw_rounded_rect(self, cr, x, y, width, height, radius):
+        """Draw a rounded rectangle path"""
+        import math
+        cr.new_path()
+        cr.arc(x + radius, y + radius, radius, math.pi, 1.5 * math.pi)
+        cr.arc(x + width - radius, y + radius, radius, 1.5 * math.pi, 2 * math.pi)
+        cr.arc(x + width - radius, y + height - radius, radius, 0, 0.5 * math.pi)
+        cr.arc(x + radius, y + height - radius, radius, 0.5 * math.pi, math.pi)
+        cr.close_path()
+
+    def _draw_translate_status(self, cr):
+        """Draw status bar for translate mode"""
+        region_count = len(self.translation_regions)
+        status = f"SELECT & TRANSLATE  |  Draw boxes around text  |  C = clear all  |  Z = undo  |  ESC = exit  |  Regions: {region_count}"
+
+        cr.select_font_face("Sans", 0, 1)
+        cr.set_font_size(13)
+        extents = cr.text_extents(status)
+
+        x = (self.screen_width - extents.width) / 2
+        y = 35
+
+        # Background
+        cr.set_source_rgba(0, 0, 0, 0.8)
+        self._draw_rounded_rect(cr, x - 15, y - 22, extents.width + 30, 32, 6)
+        cr.fill()
+
+        # Text
+        cr.set_source_rgba(0.4, 1.0, 0.6, 1.0)
+        cr.move_to(x, y)
+        cr.show_text(status)
+
+    # ============== End Select & Translate Methods ==============
+
     def on_button_press(self, widget, event):
+        # Translate mode: handle box drawing
+        if self.live_translate_mode and event.button == 1:
+            self._translate_mouse_press(event.x, event.y)
+            return True
+
         # Mode selector: check if clicking on a button
         if self.mode_selector_active and event.button == 1:
             if hasattr(self, 'button_rects'):
@@ -515,6 +1255,11 @@ class LiveOverlay(Gtk.Window):
         self.drawing_area.queue_draw()
 
     def on_motion(self, widget, event):
+        # Translate mode: handle box drawing
+        if self.live_translate_mode:
+            self._translate_mouse_motion(event.x, event.y)
+            return True
+
         # Mode selector hover detection
         if self.mode_selector_active:
             old_hover = self.hovered_button
@@ -563,6 +1308,11 @@ class LiveOverlay(Gtk.Window):
         return True
 
     def on_button_release(self, widget, event):
+        # Translate mode: handle box completion
+        if self.live_translate_mode and event.button == 1:
+            self._translate_mouse_release(event.x, event.y)
+            return True
+
         if event.button == 1 and self.drawing:
             self.drawing = False
             if self.ctrl_held and self.start_point and self.end_point:
@@ -669,7 +1419,32 @@ class LiveOverlay(Gtk.Window):
         return result
 
     def on_key_press(self, widget, event):
+        # T key: Toggle live translate mode
+        if event.keyval in (Gdk.KEY_t, Gdk.KEY_T):
+            if not self.edit_mode and not self.drawing and not self.mode_selector_active:
+                if self.live_translate_mode:
+                    self.stop_live_translate()
+                else:
+                    self.start_live_translate()
+                return True
+
+        # C key: Clear all translations (in translate mode)
+        if event.keyval in (Gdk.KEY_c, Gdk.KEY_C):
+            if self.live_translate_mode:
+                self.clear_translations()
+                return True
+
+        # Z key: Undo last translation (in translate mode)
+        if event.keyval in (Gdk.KEY_z, Gdk.KEY_Z):
+            if self.live_translate_mode:
+                self.undo_last_translation()
+                return True
+
         if event.keyval == Gdk.KEY_Escape:
+            # Exit live translate mode first
+            if self.live_translate_mode:
+                self.stop_live_translate()
+                return True
             if self.edit_mode:
                 self.edit_mode = False
                 self.simplified_points = []
@@ -2785,15 +3560,20 @@ def main():
 Modes:
   --static   Screenshot-based overlay (default, works everywhere)
   --live     Layer-shell overlay with live screen (Hyprland/Sway only)
+  --live-translate   Start in live translate mode (requires --live, Ollama)
         """
     )
     parser.add_argument('--live', action='store_true',
                        help='Use layer-shell for live screen overlay (Hyprland/Sway only)')
     parser.add_argument('--static', action='store_true',
                        help='Use screenshot-based overlay (default)')
+    parser.add_argument('--live-translate', action='store_true',
+                       help='Start directly in live translate mode (requires --live and Ollama)')
     args = parser.parse_args()
 
-    use_live_mode = args.live
+    # --live-translate implies --live
+    use_live_mode = args.live or getattr(args, 'live_translate', False)
+    start_live_translate = getattr(args, 'live_translate', False)
 
     # Check if live mode is requested but not available
     if use_live_mode and not LAYER_SHELL_AVAILABLE:
@@ -2830,6 +3610,11 @@ Modes:
         # Live mode - no screenshot needed, overlay is transparent
         overlay = LiveOverlay(on_selection)
         overlay.show_all()
+
+        # Auto-start live translate if requested
+        if start_live_translate:
+            GLib.timeout_add(100, overlay.start_live_translate)
+
         Gtk.main()
     else:
         # Static mode - take screenshot first
